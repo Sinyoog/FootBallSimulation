@@ -40,6 +40,7 @@ from database import get_conn
 from competition.cup_engine import (
     _cup_target_bracket_size, _cup_bye_count, _round_name,
     _match_outcome, _resolve_pso, _winner_of,
+    is_neutral_round, cup_home_adv,   # [2026-11] 결승·3·4위전 중립 판정(국내컵과 같은 규칙)
 )
 from constants import day_to_week, week_to_day, SECOND_HALF_START
 from competition.competition_common import (league_day_map, pick_free_day,
@@ -730,17 +731,18 @@ def _sim_ai_lower_cup_match(c, m, forced=None):
         import controlled_matches as _cm
         _g2_t = _cm.target_team_ids()
         if _g2_t and (m["home_team_id"] in _g2_t or m["away_team_id"] in _g2_t):
-            _g2 = _cm.sim_target_match(m["home_team_id"], m["away_team_id"], home_adv=0.0, extra_time=True,
+            _g2 = _cm.sim_target_match(m["home_team_id"], m["away_team_id"], home_adv=cup_home_adv(m.get("round_name")), extra_time=True,
                                        comp_name=_g2_cn(c, m), kind="lower_cup", week=m.get("week"), day=m.get("day"),
                                        targets=_g2_t, strength_rule="lower_cup")   # [2026-11] 대회별 전력 가산(D)
         if _cm.covered("lower_cup_entries", "lower_cup_matches", m["tournament_id"]):
             # [2026-10 A안] 내가 참가하는 대회의 AI 경기 — 엔진으로 돌려 실측 기록(controlled_matches.sim_cover_match)
-            _g2 = _cm.sim_cover_match(m["home_team_id"], m["away_team_id"], home_adv=0.0, extra_time=True,
+            _g2 = _cm.sim_cover_match(m["home_team_id"], m["away_team_id"], home_adv=cup_home_adv(m.get("round_name")), extra_time=True,
                                       comp="lower_cup", tkey=f"lower_cup:{m['tournament_id']}", targets=_g2_t, prior=_g2,
                                       strength_rule="lower_cup")   # [2026-11] 대회별 전력 가산(D)
         if _g2 is not None:
             forced = (_g2["hs"], _g2["as"])
-    outcome = None if forced is not None else _match_outcome(h_ovr, a_ovr, _hm, _am)
+    outcome = None if forced is not None else _match_outcome(h_ovr, a_ovr, _hm, _am,
+                                                             neutral=is_neutral_round(m.get("round_name")))
     if forced is not None:   # [G1] 내 팀 경기(내가 결장) — 체인 엔진 스코어(연장 포함)
         hs, as_ = forced
     elif outcome == "home":
@@ -972,6 +974,7 @@ def get_my_lower_cup_match(week, day=None, p=None, st=None):
         "round_name": m["round_name"],
         "opp": oe["team_name"] if oe else "?",
         "is_home": is_home,
+        "neutral": is_neutral_round(m["round_name"]),   # [2026-11] 결승·3·4위전 — 화면에 "중립"
         "week": week,
     }
 
@@ -1058,8 +1061,8 @@ def sim_my_lower_cup_match_as_ai(week, p, reason="injury", day=None):
     if m["home_score"] != -1:
         return  # 이미 처리됨(멱등)
     from game_engine import _chain_team_score
-    _cs = _chain_team_score(m["home_team_id"], m["away_team_id"], 0.0, extra_time=True,
-                            strength_rule="lower_cup")   # [2026-11 전력 기준 통일]
+    _cs = _chain_team_score(m["home_team_id"], m["away_team_id"], cup_home_adv(m.get("round_name")), extra_time=True,
+                            strength_rule="lower_cup")   # [2026-11] 결승·3·4위전만 중립   # [2026-11 전력 기준 통일]
     _sim_ai_lower_cup_match(get_conn().cursor(), m,
                             forced=((_cs["home_score"], _cs["away_score"]) if _cs is not None else None))
     get_conn().commit()
@@ -1069,7 +1072,8 @@ def sim_my_lower_cup_match_as_ai(week, p, reason="injury", day=None):
     import controlled_matches as _cm_abs
     _cm_abs.save_absent_match(_cs, m["home_team_id"], m["away_team_id"], info.get("is_home"),
                               t.get("name") or "하부리그 컵", "lower_cup", week=week, day=m.get("day") or day,
-                              reason=reason, real_ctx={"comp": "lower_cup", "tkey": f"lower_cup:{m['tournament_id']}"})
+                              reason=reason, real_ctx={"comp": "lower_cup", "tkey": f"lower_cup:{m['tournament_id']}"},
+                              neutral=bool(info.get("neutral")))   # [2026-11] 중립 경기면 상세·로그에 "중립"
     _advance_after_my_match(t["id"], week)
 
 
@@ -1162,7 +1166,7 @@ def simulate_my_lower_cup_match(week, p, day=None):
         _fconn.close()
         sim = simulate_my_match(
             m["home_team_id"], m["away_team_id"], home_formation, away_formation,
-            home_adv=0.0,
+            home_adv=cup_home_adv(m.get("round_name")),   # [2026-11] 결승·3·4위전만 중립, 그 전 라운드는 홈 이점
             extra_time=True,
             me=_chain_me_spec(p, is_home, "out" if _suspended else ("bench" if _benched else "start")),
             strength_rule="lower_cup")   # [2026-11 전력 기준 통일] AI 경기와 같은 전력
@@ -1181,7 +1185,7 @@ def simulate_my_lower_cup_match(week, p, day=None):
         _chain_note_error(__name__, _e_chain)
         _chain = None
         engine_stats = engine_plog = player_ratings = None
-        outcome = _match_outcome(h_ovr, a_ovr)
+        outcome = _match_outcome(h_ovr, a_ovr, neutral=is_neutral_round(m.get("round_name")))
         hs, as_ = _gen_score(outcome, h_ovr - a_ovr, allow_extreme=True, top=(h_ovr, a_ovr))
 
     pso_winner, pso_score = 0, ""
@@ -1285,7 +1289,9 @@ def simulate_my_lower_cup_match(week, p, day=None):
 
     _update_pop(p, goals, assists, rating)
     p2 = get_player()
-    ns = min(100, p2["stress"] + 20)
+    # [2026-11 통일] 리그와 같은 결과 기반 공식(game_engine.match_stress_gain) — 예전 +20 고정
+    from game_engine import match_stress_gain
+    ns = min(100, p2["stress"] + match_stress_gain(my_result))
     nh = p2["happiness"]
     if my_result == "win":
         nh = min(100, nh + 4)
@@ -1313,7 +1319,8 @@ def simulate_my_lower_cup_match(week, p, day=None):
         events, not (_suspended or _benched), _benched, detail, pso=pso,
         engine_stats=engine_stats, engine_plog=engine_plog, player_ratings=player_ratings,
         match_extra={"score_90": ([hs90, as90] if hs90 is not None else [hs, as_]),
-                     "went_extra_time": went_et, "subs": _subs},
+                     "went_extra_time": went_et, "subs": _subs,
+                     "neutral": bool(is_neutral_round(m.get("round_name")))},   # [2026-11] 경기 상세 머리글 "(중립)"
         # [2026-10 신설] 이 경기 AI 선수 실측 기록(real_stats)
         real_ctx={"comp": "lower_cup", "tkey": f"lower_cup:{m['tournament_id']}", "home": m["home_team_id"], "away": m["away_team_id"]})
     marker = f" [match:{detail_id}:lower_cup]" if detail_id else ""

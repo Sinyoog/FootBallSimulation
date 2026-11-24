@@ -50,7 +50,7 @@ def starter_counts(formation):
     return {p: s[p] for p in TARGET_POSITIONS}
 
 
-def _cap(u, k, seat, tier):
+def _cap(u, k, seat, tier, fw_extra=True):
     kk = k[u]
     if u == "GK":
         return 1 if (tier == 1 or seat < 26) else 2
@@ -61,7 +61,9 @@ def _cap(u, k, seat, tier):
     if u == "MID":
         return min(min(kk, 4) + (tier - 1), 9 - kk)
     if u == "FW":
-        return max(kk, 2) + (tier - 1)
+        # [2026-11-21 대안 B — 클럽 공통 수요 장부 전용] fw_extra=False면 2단계 FW +1이 없다
+        # (무윙 투톱 3-5-2·5-3-2·3-4-1-2의 T≥25 FW 5 → 4). 기존 호출(fw_extra=True)은 그대로.
+        return max(kk, 2) + ((tier - 1) if fw_extra else 0)
     return kk if (tier == 1 or kk >= 3) else kk + 1             # CB: 3백은 6명에서 멈춤
 
 
@@ -75,6 +77,16 @@ def _score(u, k, res):
 @functools.lru_cache(maxsize=None)
 def reserve_order(formation):
     """12번째~28번째 자리의 목표 포지션 순서(tuple, 길이 17). 목표표의 유일한 원천."""
+    return _reserve_order(formation, True)
+
+
+@functools.lru_cache(maxsize=None)
+def reserve_order_b(formation):
+    """[2026-11-21 대안 B] reserve_order와 같고 FW 2단계 +1만 없다 — club_ledger 목표표 전용."""
+    return _reserve_order(formation, False)
+
+
+def _reserve_order(formation, fw_extra):
     s = starter_counts(formation)
     k = {"GK": 1, "CB": s["CB"], "MID": s["CDM"] + s["CM"] + s["CAM"], "FW": s["FW"],
          "LB": s["LB"], "RB": s["RB"], "LW": s["LW"], "RW": s["RW"]}
@@ -87,7 +99,7 @@ def reserve_order(formation):
         res[u] += 1; units.append(u); seat += 1
     for tier in (1, 2):
         while seat <= MAX_SQUAD:
-            cand = [u for u in _UNITS if res[u] < _cap(u, k, seat, tier)]
+            cand = [u for u in _UNITS if res[u] < _cap(u, k, seat, tier, fw_extra)]
             if not cand:
                 break
             u = max(cand, key=lambda u: (round(_score(u, k, res), 9), -_UNITS.index(u)))
@@ -183,6 +195,19 @@ def _order_cached(formation, gk3):
     if not gk3:
         return reserve_order(formation)
     return ("GK", "GK") + field_reserve_order(formation)
+
+
+@functools.lru_cache(maxsize=None)
+def targets_gk3_b(formation, n):
+    """[2026-11-21 대안 B] club_ledger 목표표의 바탕 — GK 3명 표(_targets_cached(…, gk3=True))와 같은 규칙에
+    FW 2단계 +1만 뺀 순서표를 쓴다. 측면 좌우 균형(_balanced_take)도 같다."""
+    f = _formation(formation)
+    n = max(11, min(int(n), MAX_SQUAD))
+    t = dict(starter_counts(f))
+    order = ("GK", "GK") + tuple(p for p in reserve_order_b(f) if p != "GK")
+    for p in _balanced_take(order, n - 11):
+        t[p] += 1
+    return t
 
 
 _SIDE_PAIRS = (("LB", "RB"), ("LW", "RW"))

@@ -40,6 +40,7 @@
   계약 칸은 입대 때만 "2년". 선수검색 상세 표 9번째 칸 "군대"(한국 선수만
   보임, 어떤 난이도에서도 편집 불가): 면제/미필/복무중/군필.
 """
+import virtual_youth as _VY   # [2026-11-22 1단계] 가상 유스 공통 판정
 from constants import (
     MILITARY_ENABLED, MILITARY_COUNTRY, MILITARY_TARGET_NATIONALITY,
     MILITARY_STATUS_NONE, MILITARY_STATUS_LABELS,
@@ -258,7 +259,7 @@ def compute_league_levels(conn) -> dict:
     out = {}
     for lid, avg in conn.execute(
             "SELECT t.league_id, AVG(ap.ovr) FROM ai_players ap JOIN teams t ON ap.team_id=t.id "
-            "GROUP BY t.league_id").fetchall():
+            + _VY.where_not_vt(conn, "t.") + " GROUP BY t.league_id").fetchall():   # [2026-11-22 1단계] 가상 유스 제외
         if lid in mil or avg is None:
             continue
         out[lid] = float(avg)
@@ -528,15 +529,19 @@ def run_initial_enlistment(conn, start_year) -> dict:
         parent = p["loan_from"] or cur_team
         ey = p["enlist_year"]
         rng = _rng_for(conn, f"milfill:{pid}")
+        _vy_par = _VY.mil_virtual(conn, parent)   # [2026-11-22 1단계] 가상 유스 소속
         # 4) 계약
-        if parent and (p["cend"] or 0) >= ey + 1:
+        if _vy_par:
+            loan_from, loan_ret, cend = parent, ey + 1, 0
+            stats["loan"] += 1
+        elif parent and (p["cend"] or 0) >= ey + 1:
             loan_from, loan_ret, cend = parent, ey + 1, p["cend"]
             stats["loan"] += 1
         else:
             loan_from, loan_ret, cend = 0, 0, ey + 1
             stats["fa"] += 1
-        # 5) 빈자리 — 군인이 실제로 뛰던 팀(cur_team)에 같은 자리 선수
-        if cur_team:
+        # 5) 빈자리 — 군인이 실제로 뛰던 팀(cur_team)에 같은 자리 선수(가상 유스 팀은 복제하지 않음)
+        if cur_team and not _VY.mil_virtual(conn, cur_team):
             conn.execute(f"INSERT INTO ai_players({col_list}) SELECT {col_list} FROM ai_players WHERE id=?", (pid,))
             new_id = conn.execute("SELECT MAX(id) FROM ai_players").fetchone()[0]
             age = p["age"]
@@ -661,16 +666,21 @@ def _discharge(conn, finished_year, stats):
     if not rows:
         return
     counts = {t: n for t, n in conn.execute("SELECT team_id, COUNT(*) FROM ai_players GROUP BY team_id").fetchall()}
+    _vy_ids = _VY.vids_fast(conn)   # [2026-11-22 1단계] 가상 유스 팀 — FA 입단처에서 제외(없으면 빈 집합)
     teams_by_league = {}
     for tid, lid in conn.execute("SELECT id, league_id FROM teams ORDER BY id").fetchall():
-        if tid not in mil:
+        if tid not in mil and tid not in _vy_ids:
             teams_by_league.setdefault(lid, []).append(tid)
     exists = {t for lst in teams_by_league.values() for t in lst}
     season = _season_no(conn, finished_year)
     logs = []
     for pid, nm, pos, age, ovr, tid, loan_from, cend, pre_t, pre_l, pre_sal in rows:
         dest, new_cend = 0, cend or 0
-        if loan_from and loan_from in exists and (cend or 0) > finished_year:
+        _vy_home = next((t for t in (loan_from, pre_t) if t and t in _vy_ids), 0) if _vy_ids else 0
+        if _vy_home:
+            dest, new_cend, pre_sal = _vy_home, 0, 0
+            stats["returned"] += 1
+        elif loan_from and loan_from in exists and (cend or 0) > finished_year:
             dest = loan_from
             stats["returned"] += 1
         else:
@@ -922,7 +932,10 @@ def _enlist_new_year(conn, new_year, stats):
             pool = list(all_t)
         t = min(pool, key=lambda t: (posc[t].get(g, 0), fill.get(t, 0), t))
         parent = d["loan_from"] or d["team"]
-        if parent and d["cend"] >= new_year + 1 and not d.get("abroad"):   # [2026-10] 해외 구단은 계약 해지
+        if _VY.mil_virtual(conn, parent):   # [2026-11-22 1단계] 가상 유스 — 계약 0 유지, 복귀처 = 가상 팀
+            loan_from, loan_ret, cend = parent, new_year + 1, 0
+            stats["loan"] += 1
+        elif parent and d["cend"] >= new_year + 1 and not d.get("abroad"):   # [2026-10] 해외 구단은 계약 해지
             loan_from, loan_ret, cend = parent, new_year + 1, d["cend"]
             stats["loan"] += 1
         else:

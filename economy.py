@@ -15,6 +15,7 @@
 game_engine.py는 이 모듈에서 필요한 함수를 import해서 그대로 쓴다
 (호출부 시그니처는 전혀 안 바뀜).
 """
+import virtual_youth as _VY   # [2026-11-22 1단계] 가상 유스 공통 판정
 
 # [2026-08 신설, 신민용 확정: "재능이 신급인 선수만 국가별 상한을 뚫는
 # 초월적 스타 연봉이 나와야 한다"] _calc_salary(talent_tier="god")에서만
@@ -167,11 +168,12 @@ def _build_rank_table(year):
         try:
             rows = c.execute("""SELECT p.id, p.ovr, p.position, p.potential_ovr, s.rating FROM ai_players p
                 LEFT JOIN hist.ai_player_season_stats s ON s.player_id=p.id AND s.year=?
-                WHERE p.team_id>0""", ((year or 0) - 1,)).fetchall()
+                WHERE p.team_id>0""" + _VY.and_not_vp(c, "p.team_id"), ((year or 0) - 1,)).fetchall()   # [2026-11-22 1단계] 가상 유스 제외
         except Exception:
             RANK_STATS["no_rating"] += 1
             rows = [(r[0], r[1], r[2], r[3], None) for r in c.execute(
-                "SELECT id, ovr, position, potential_ovr FROM ai_players WHERE team_id>0").fetchall()]
+                "SELECT id, ovr, position, potential_ovr FROM ai_players WHERE team_id>0"
+                + _VY.and_not_vp(c, "team_id")).fetchall()]   # [2026-11-22 1단계] 가상 유스 제외
     finally:
         c.close()
     T = {"key": year, "rank_of": {}, "block": {}, "above": {}, "buyers": _big5_buyers()}
@@ -240,7 +242,7 @@ def _build_rank_table_light(year):
         if counts is None:
             counts = [tuple(r) for r in c.execute(
                 "SELECT COALESCE(position,'')='GK', ovr, COUNT(*) FROM ai_players WHERE +team_id>0 "
-                "GROUP BY 1, 2").fetchall()]
+                + _VY.and_not_vp(c, "team_id") + " GROUP BY 1, 2").fetchall()]   # [2026-11-22 1단계] 가상 유스 제외
             if _DISPLAY["depth"]:
                 _DISPLAY["counts"] = counts
         if any(r[1] is None or r[1] <= 0 for r in counts):
@@ -262,7 +264,7 @@ def _build_rank_table_light(year):
         top = []
         if cut is not None:
             _sql = """SELECT p.position FROM ai_players p {join}
-                WHERE +p.team_id>0 AND COALESCE(p.position,'')<>'GK' AND p.ovr>=?
+                WHERE +p.team_id>0 """ + _VY.and_not_vp(c, "p.team_id") + """ AND COALESCE(p.position,'')<>'GK' AND p.ovr>=?
                 ORDER BY p.ovr DESC, {rat} DESC, COALESCE(NULLIF(p.potential_ovr,0), p.ovr) DESC, p.id
                 LIMIT 2000"""
             try:

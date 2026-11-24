@@ -1108,6 +1108,7 @@ def get_my_cwc_match(week: int, day=None, p=None, st=None):
         "opp_country": oe["country"] if oe else "?",
         "opp_flag": "",
         "is_home": is_home,
+        "neutral": m["stage"] in ("F", "TP"),   # [2026-11] 중립 경기(결승 등) — 시뮬이 home_adv=0이라 화면에도 홈/원정 대신 "중립" (simulate_my_cwc_match와 같은 기준)
         "week": week,
     }
 
@@ -1235,7 +1236,8 @@ def sim_my_cwc_match_as_ai(week, p, reason="injury", day=None):
     import controlled_matches as _cm_abs
     _cm_abs.save_absent_match(_cs, m["home_team_id"], m["away_team_id"], info.get("is_home"),
                               "클럽 월드컵", "cwc", week=week, day=(dict(m).get("day") or day), reason=reason,
-                              real_ctx={"comp": "cwc", "tkey": f"cwc_tournaments:{m['tournament_id']}"})
+                              real_ctx={"comp": "cwc", "tkey": f"cwc_tournaments:{m['tournament_id']}"},
+                              neutral=bool(info.get("neutral")))   # [2026-11] 중립 경기면 상세·로그에 "중립"
 
 
 def simulate_my_cwc_match(week, p, day=None):
@@ -1445,7 +1447,9 @@ def simulate_my_cwc_match(week, p, day=None):
 
     _update_pop(p, goals, assists, rating)
     p2 = get_player()
-    ns = min(100, p2["stress"] + 20)
+    # [2026-11 통일] 리그와 같은 결과 기반 공식(game_engine.match_stress_gain) — 예전 +20 고정
+    from game_engine import match_stress_gain
+    ns = min(100, p2["stress"] + match_stress_gain(my_result))
     nh = p2["happiness"]
     if my_result == "win":
         nh = min(100, nh + 4)
@@ -1474,7 +1478,8 @@ def simulate_my_cwc_match(week, p, day=None):
         events, not (_suspended or _benched), _benched, detail, pso=pso,
         engine_stats=engine_stats, engine_plog=engine_plog, player_ratings=player_ratings,
         match_extra={"score_90": ([hs90, as90] if hs90 is not None else [hs, as_]),
-                     "went_extra_time": went_et, "subs": _subs},
+                     "went_extra_time": went_et, "subs": _subs,
+                     "neutral": bool(_neutral_stage)},   # [2026-11] 경기 상세 머리글 "(중립)"
         # [2026-10 신설] 이 경기 AI 선수 실측 기록(real_stats)
         real_ctx={"comp": "cwc", "tkey": f"cwc_tournaments:{m['tournament_id']}", "home": m["home_team_id"], "away": m["away_team_id"]})
     marker = f" [match:{detail_id}:cwc]" if detail_id else ""

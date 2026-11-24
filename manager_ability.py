@@ -20,6 +20,7 @@
 
 [결정성] 전역 random을 쓰지 않는다 — (월드 salt, 감독 id)에서 파생한 Random만.
 """
+import virtual_youth as _VY   # [2026-11-22 1단계] 가상 유스 공통 판정
 import math
 import random
 import zlib
@@ -85,8 +86,8 @@ def _team_ovr_map_query(conn):
             """SELECT team_id, AVG(ovr) FROM (
                    SELECT team_id, ovr, ROW_NUMBER() OVER (
                        PARTITION BY team_id ORDER BY ovr DESC) AS rn
-                   FROM ai_players WHERE team_id IS NOT NULL)
-               WHERE rn <= 11 GROUP BY team_id"""):
+                   FROM ai_players WHERE team_id IS NOT NULL""" + _VY.and_not_vp(conn, "team_id") + """)
+               WHERE rn <= 11 GROUP BY team_id"""):   # [2026-11-22 1단계] 가상 유스 제외
         if v is not None:
             out[int(tid)] = float(v)
     return out

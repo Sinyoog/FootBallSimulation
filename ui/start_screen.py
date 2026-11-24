@@ -992,6 +992,8 @@ class NewPlayerDialog(QDialog):
         "mismatch_immune": ("포지션 미스매치 페널티 면역", "flag"),
         "aging_decline_mult": ("30대 이후 능력 하락폭", "x"),
         "injury_recovery_mult": ("부상 복귀 기간", "x"),
+        # [2026-11-21] 페어플레이어
+        "no_cards": ("옐로카드·레드카드를 절대 받지 않음 (모든 대회·국가대표)", "flag"),
     }
 
     def _fmt_effect(self, key, value):

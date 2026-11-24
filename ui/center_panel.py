@@ -643,9 +643,13 @@ class CenterPanel(QWidget):
         # [2026-10 신설, 신민용 확정] 임대 버튼 — 팀 입단과 순위표 사이. 소속팀이 있을 때만
         # 누를 수 있다(팀 입단 버튼은 무소속일 때만 보이므로 둘이 자연스럽게 맞물린다).
         self.btn_loan     = QPushButton("🔄 임대 신청");    self.btn_loan.setObjectName("actBtn")
+        # [2026-11-21 신설·재설계, 신민용 확정] 이적 요청 버튼 — 임대 신청 바로 옆. 내가 수락한 오퍼를 원 소속 구단이
+        # 거절했을 때만 켜진다(그 오퍼 1건에 1번, 같은 오퍼 창 안). 누르면 구단이 그 오퍼를 다시 판정한다
+        # (game_engine.request_transfer — 감독 관계 −25, 최소 요구액 비핵심 ×0.95 / 핵심 ×0.98).
+        self.btn_transfer_req = QPushButton("📣 이적 요청"); self.btn_transfer_req.setObjectName("actBtn")
         self.btn_standing = QPushButton("📊 순위표");       self.btn_standing.setObjectName("actBtn")
         self.btn_schedule = QPushButton("📅 경기일정");     self.btn_schedule.setObjectName("actBtn")
-        for b in [self.btn_join, self.btn_loan, self.btn_standing, self.btn_schedule]:
+        for b in [self.btn_join, self.btn_loan, self.btn_transfer_req, self.btn_standing, self.btn_schedule]:
             row1.addWidget(b)
         self.lay.addLayout(row1)
 
@@ -702,6 +706,7 @@ class CenterPanel(QWidget):
         # 버튼 연결
         self.btn_join.clicked.connect(self._do_join)
         self.btn_loan.clicked.connect(self._do_loan)
+        self.btn_transfer_req.clicked.connect(self._do_transfer_request)
         self.btn_standing.clicked.connect(self._do_standings)
         self.btn_schedule.clicked.connect(self._do_schedule)
         self.btn_agent.clicked.connect(self._do_agent)
@@ -847,13 +852,16 @@ class CenterPanel(QWidget):
         game_engine._simulate_match의 실제 공식과 따로 놀아서(하드코딩된
         옛날 값 +5/+8/+8 을 그대로 표시), 실제 진행 시 적용되는 값(18/22,
         30세 이상은 13/16)과 화면 표시가 어긋났다. 실제 공식과 동일하게
-        맞춘다 — 리그/챔스/컵/국제전 전부 이 함수 하나로 통일."""
-        age = p.get("age", 0) or 0
-        if age >= 30:
-            return 10 if is_home else 14
-        if age >= 25:
-            return 16 if is_home else 20
-        return 18 if is_home else 22
+        맞춘다 — 리그/챔스/컵/국제전 전부 이 함수 하나로 통일.
+
+        [2026-11 수정] 리그는 2026-08 개편으로 홈/원정·나이 차등이 없어지고 결과 기반
+        (game_engine.match_stress_gain — 승/무/패)이 됐는데 이 미리보기만 옛 홈/원정·나이
+        공식이 남아 있었다(다른 대회도 이번에 같은 공식으로 통일). 경기 전엔 결과를 모르므로
+        "최소~최대"(예: 6~16) 문자열을 돌려준다 — 호출부는 그대로 f"스트레스 +{...}".
+        p·is_home 인자는 호출부 호환용으로만 남긴다(값에 영향 없음)."""
+        from game_engine import match_stress_range
+        lo, hi = match_stress_range()
+        return f"{lo}~{hi}" if lo != hi else f"{lo}"
 
     def refresh(self):
         p  = get_player()
@@ -1186,7 +1194,7 @@ class CenterPanel(QWidget):
                     #   밝은 연두 배경)으로 의도적으로 확 튀게, 슈퍼컵: 골드.
                     stage = match_info.get("stage_ko", "")
                     opp   = f"{match_info.get('opp_flag','')}{match_info.get('opp','')}"
-                    loc   = "홈" if match_info.get("is_home") else "원정"
+                    loc   = "중립" if match_info.get("neutral") else ("홈" if match_info.get("is_home") else "원정")
                     hl.setText(f"스트레스 +{self._match_stress_preview(p, match_info.get('is_home', False))}")
                     if ml:
                         _CL_KIND_STYLE = {
@@ -1204,7 +1212,7 @@ class CenterPanel(QWidget):
                 elif match_info.get("domestic_sc"):
                     # [2026-11-15 신설] 국내(리그) 슈퍼컵 — 단판 결승. 브론즈(대륙 슈퍼컵 골드와 구분).
                     opp   = f"{match_info.get('opp_flag','')}{match_info.get('opp','')}"
-                    loc   = "홈" if match_info.get("is_home") else "원정"
+                    loc   = "중립" if match_info.get("neutral") else ("홈" if match_info.get("is_home") else "원정")
                     hl.setText(f"스트레스 +{self._match_stress_preview(p, match_info.get('is_home', False))}")
                     if ml:
                         ml.setText(_card_text("🏵", match_info['league_name'], f"결승 ({loc})", f"vs {opp}"))
@@ -1217,7 +1225,7 @@ class CenterPanel(QWidget):
                     opp   = match_info.get("opp", "")
                     _otier = match_info.get("opp_tier")
                     opp_disp = f"{opp} ({_otier}부)" if _otier else opp
-                    loc   = "홈" if match_info.get("is_home") else "원정"
+                    loc   = "중립" if match_info.get("neutral") else ("홈" if match_info.get("is_home") else "원정")
                     hl.setText(f"스트레스 +{self._match_stress_preview(p, match_info.get('is_home', False))}")
                     if ml:
                         ml.setText(_card_text("🎖️", match_info['league_name'], f"{rname} ({loc})", f"vs {opp_disp}"))
@@ -1237,7 +1245,7 @@ class CenterPanel(QWidget):
                     opp   = match_info.get("opp", "")
                     _otier = match_info.get("opp_tier")
                     opp_disp = f"{opp} ({_otier}부)" if _otier else opp
-                    loc   = "홈" if match_info.get("is_home") else "원정"
+                    loc   = "중립" if match_info.get("neutral") else ("홈" if match_info.get("is_home") else "원정")
                     hl.setText(f"스트레스 +{self._match_stress_preview(p, match_info.get('is_home', False))}")
                     if ml:
                         ml.setText(_card_text("🎖️", match_info['league_name'], f"{rname} ({loc})", f"vs {opp_disp}"))
@@ -1252,7 +1260,7 @@ class CenterPanel(QWidget):
                     opp   = match_info.get("opp", "")
                     opp_country = match_info.get("opp_country", "")
                     opp_disp = f"{opp}({opp_country})" if opp_country else opp
-                    loc   = "홈" if match_info.get("is_home") else "원정"
+                    loc   = "중립" if match_info.get("neutral") else ("홈" if match_info.get("is_home") else "원정")
                     hl.setText(f"스트레스 +{self._match_stress_preview(p, match_info.get('is_home', False))}")
                     if ml:
                         ml.setText(_card_text("🌍", "클럽 월드컵", f"{stage} ({loc})", f"vs {opp_disp}"))
@@ -1415,16 +1423,23 @@ class CenterPanel(QWidget):
             self.btn_loan.setText(loan_button_label(p))
         except Exception as _le:
             print("임대 버튼 갱신 오류:", _le)
+        # [2026-11-21 신설] 이적 요청 버튼 — 임대 버튼과 같은 방식: 열 수 있는 상태면 켜고(창에서 상태·제출 가능
+        # 여부를 엔진 판정 그대로 보여준다), 문구에 볼 것(구단 거절·결과)을 표시한다.
+        try:
+            from ui.transfer_request_window import transfer_button_state, transfer_button_label
+            _tr_ok, _tr_tip = transfer_button_state(p)
+            self.btn_transfer_req.setEnabled(_tr_ok)
+            self.btn_transfer_req.setToolTip(_tr_tip)
+            self.btn_transfer_req.setText(transfer_button_label(p))
+        except Exception as _tre:
+            print("이적 요청 버튼 갱신 오류:", _tre)
 
         # [오퍼 토글] 시즌 구간과 무관하게 언제든 켜고 끌 수 있다.
-        #   OFF여도 '이적 요청' 중이면 오퍼는 계속 뜨므로 라벨로 안내한다.
+        #   [2026-11-21] 이적 요청 재설계로 "이적 요청 중이면 OFF여도 오퍼가 옴" 예외는 폐기.
         offers_on = bool(p.get("offers_enabled", 1))
         if offers_on:
             self.btn_offer_toggle.setText("🔔 오퍼 ON")
             self.btn_offer_toggle.setToolTip("클릭하면 자동 이적 오퍼 알림을 끕니다")
-        elif p.get("transfer_requested"):
-            self.btn_offer_toggle.setText("🔕 오퍼 OFF*")
-            self.btn_offer_toggle.setToolTip("이적 요청 중이라 오퍼는 계속 옵니다. 클릭하면 다시 켭니다")
         else:
             self.btn_offer_toggle.setText("🔕 오퍼 OFF")
             self.btn_offer_toggle.setToolTip("클릭하면 자동 이적 오퍼 알림을 켭니다 (팀 입단에는 영향 없음)")
@@ -1819,6 +1834,7 @@ class CenterPanel(QWidget):
 
     def _update_preview(self):
         total_stress = 0
+        total_stress_hi = 0   # [2026-11] 경기일은 "+6~16"처럼 범위라 최대값을 따로 더한다
         total_load = 0
         # 휴식 행복도는 실제로 random.randint(4,8) → 평균 6으로 추산하되,
         # 표시는 범위(+4~8)임을 알 수 있게 한다.
@@ -1847,15 +1863,17 @@ class CenterPanel(QWidget):
                 import re
                 _hint_txt = self.week_hints[i].text()
                 if "스트레스" in _hint_txt:   # 부상("N일 남음") 등은 제외
-                    m = re.search(r"([+-]?\d+)", _hint_txt)
+                    m = re.search(r"([+-]?\d+)(?:~([+-]?\d+))?", _hint_txt)
                     if m:
                         total_stress += int(m.group(1))
+                        total_stress_hi += int(m.group(2) if m.group(2) else m.group(1))
                 continue
             sel   = cb.currentText()
             ttype = TRAIN_MAP_KO.get(sel, "중강도")
             s_chg = effective_training_stress(p, ttype)
             l_chg = effective_training_injury_load(p, ttype)
             total_stress += s_chg
+            total_stress_hi += s_chg
             total_load += l_chg
             if ttype == "휴식":
                 rest_count += 1
@@ -1863,7 +1881,11 @@ class CenterPanel(QWidget):
             self.week_hints[i].setText(f"스트레스 {sign}{s_chg}")
 
         ss = "+" if total_stress >= 0 else ""
-        self.lbl_pv_stress.setText(f"{ss}{total_stress}")
+        if total_stress_hi != total_stress:
+            sh = "+" if total_stress_hi >= 0 else ""
+            self.lbl_pv_stress.setText(f"{ss}{total_stress}~{sh}{total_stress_hi}")
+        else:
+            self.lbl_pv_stress.setText(f"{ss}{total_stress}")
         ls = "+" if total_load >= 0 else ""
         self.lbl_pv_load.setText(f"{ls}{total_load}")
         if rest_count:
@@ -3593,6 +3615,89 @@ class CenterPanel(QWidget):
         dlg.exec()
         dlg.deleteLater()
 
+    def _show_high_value_sale(self, hv) -> bool:
+        """[2026-11-20 신설, 신민용+GPT 확정 — 고가 매각 검토] 판매추진 창과 같은 모양으로 "구단 매각 제안"을
+        보여준다. 판매추진(구단이 정리하려고 압박)과 달리 좋은 금액이 와서 의사를 묻는 것 — 거절해도 불이익이
+        없고, 창을 그냥 닫아도 거절과 같다. 반환 True = 수락(이적 예약됨)."""
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame
+        from game_engine import accept_high_value_sale, reject_high_value_sale
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("💰 구단 매각 제안")
+        dlg.setMinimumWidth(440)
+        dlg.setStyleSheet(_DIALOG_STYLE)
+        root = QVBoxLayout(dlg)
+        root.setContentsMargins(18, 16, 18, 16); root.setSpacing(10)
+
+        hdr = QLabel("💰 좋은 제안이 왔습니다 — 구단은 매각할 의향이 있습니다")
+        hdr.setObjectName("dlgHeader")
+        hdr.setWordWrap(True)
+        root.addWidget(hdr)
+
+        card = QFrame(); card.setObjectName("dlgCard")
+        cl = QVBoxLayout(card); cl.setContentsMargins(14, 12, 14, 12); cl.setSpacing(5)
+        cl.addWidget(QLabel(
+            f"<b style='color:#fff;font-size:14px'>{hv.get('flag', '')} {hv.get('team_name', '')}</b>"))
+        cl.addWidget(QLabel(
+            f"<span style='color:#bbb'>{hv.get('league_name', '')} ({hv.get('country', '')}, "
+            f"{hv.get('tier', '?')}부)</span>"))
+        cl.addWidget(QLabel(""))
+        _info = hv.get("_hv") or {}
+        _ratio = _info.get("ratio")
+        _ratio_txt = (f"  <span style='color:#888;font-size:11px'>(시장가의 {_ratio:.2f}배)</span>"
+                      if isinstance(_ratio, (int, float)) else "")
+        cl.addWidget(QLabel(
+            f"<span style='color:#bbb'>이적료</span>  "
+            f"<b style='color:#ffcc33'>{fmt_money(hv.get('transfer_fee', 0))}</b>{_ratio_txt}"))
+        cl.addWidget(QLabel(
+            f"<span style='color:#bbb'>제시 연봉</span>  "
+            f"<b style='color:#00cc66'>{fmt_money(hv.get('salary', 0))} / 년</b>"))
+        if hv.get("contract_years"):
+            cl.addWidget(QLabel(
+                f"<span style='color:#bbb'>계약 기간</span>  "
+                f"<b style='color:#fff'>{hv['contract_years']}년</b>"))
+        if hv.get("role"):
+            cl.addWidget(QLabel(
+                f"<span style='color:#bbb'>역할</span>  "
+                f"<b style='color:#88ccff'>{hv['role']}</b>"))
+        root.addWidget(card)
+
+        note = QLabel("※ 구단이 당신을 내보내려는 것이 아니라, 좋은 금액이 와서 의사를 묻는 것입니다. "
+                      "거절해도 불이익은 없고, 이어서 이번 오퍼 목록을 평소처럼 볼 수 있습니다. "
+                      "수락하면 다음 이동 시점에 이적합니다.")
+        note.setStyleSheet("color:#888;font-size:11px;")
+        note.setWordWrap(True)
+        root.addWidget(note)
+
+        btn_row = QHBoxLayout(); btn_row.setSpacing(8)
+        btn_accept = QPushButton("✅ 이적하겠습니다"); btn_accept.setObjectName("dlgOk")
+        btn_reject = QPushButton("❌ 남겠습니다"); btn_reject.setObjectName("dlgNo")
+        btn_row.addWidget(btn_accept, 1); btn_row.addWidget(btn_reject, 1)
+        root.addLayout(btn_row)
+
+        result = {"accepted": False}
+
+        def _accept():
+            result["accepted"] = bool(accept_high_value_sale(hv))
+            dlg.accept()
+
+        btn_accept.clicked.connect(_accept)
+        btn_reject.clicked.connect(dlg.reject)
+        dlg.exec()
+        dlg.deleteLater()
+        if not result["accepted"]:
+            reject_high_value_sale(hv)   # 거절·창 닫기 모두 같은 처리(불이익 없음)
+        return result["accepted"]
+
+    def _do_transfer_request(self):
+        """[2026-11-21 재설계] 이적 요청 창 — 임대 창과 같은 형식(상태 표시 + 제출). 규칙은 엔진 그대로."""
+        from ui.transfer_request_window import TransferRequestDialog
+        dlg = TransferRequestDialog(self, _DIALOG_STYLE)
+        dlg.exec()
+        dlg.deleteLater()
+        if self.main_win:
+            self.main_win.refresh_all()
+
     def _do_loan(self):
         """[2026-10 신설] 임대 버튼 — 임대 희망 제출, 구단 제안·오퍼·예약 상태 확인."""
         from ui.loan_window import LoanDialog
@@ -4082,8 +4187,6 @@ class CenterPanel(QWidget):
             show_toast(self, "🔔 오퍼 알림을 켰습니다", "#006622", 1500)
         else:
             msg = "🔕 오퍼 알림을 껐습니다  (팀 입단은 계속 가능)"
-            if p.get("transfer_requested"):
-                msg = "🔕 오퍼 알림을 껐습니다  (단, 이적 요청 중이라 오퍼는 계속 옵니다)"
             show_toast(self, msg, "#666666", 2000)
         if self.main_win: self.main_win.refresh_all()
 
@@ -4341,9 +4444,9 @@ class CenterPanel(QWidget):
         restore = load_pending_offer_state(kind="auto_offer")
         if restore:
             # [버그수정 2026-07] 저장된 오퍼가 있어도 그 사이 사용자가 토글을
-            #   껐다면(이적 요청 중이 아닌 한) 무시하고 보여주지 않아야 한다.
+            #   껐다면 무시하고 보여주지 않아야 한다.
             #   기존엔 이 체크가 없어서 "토글을 꺼도 오퍼가 뜬다"는 문제가 있었다.
-            if not p.get("offers_enabled", 1) and not p.get("transfer_requested"):
+            if not p.get("offers_enabled", 1):
                 from game_engine import clear_pending_offer_state
                 clear_pending_offer_state()
                 self._show_military_only()
@@ -4352,10 +4455,8 @@ class CenterPanel(QWidget):
             from game_engine import refresh_offer_rank_info
             refresh_offer_rank_info(offers)
         else:
-            # [오퍼 토글] 꺼져 있으면 자동 오퍼 팝업을 건너뛴다.
-            #   단, '이적 요청' 중이면 사용자가 명시적으로 이적을 원한다는 뜻이므로
-            #   토글과 무관하게 오퍼를 계속 보여준다.
-            if not p.get("offers_enabled", 1) and not p.get("transfer_requested"):
+            # [오퍼 토글] 꺼져 있으면 자동 오퍼 팝업을 건너뛴다(2026-11-21: 이적 요청 예외 폐기).
+            if not p.get("offers_enabled", 1):
                 # [2026-10] 오퍼 토글이 꺼져 있어도 1·52주 입대 카드는 뜬다(일반 오퍼는 그대로 숨김).
                 self._show_military_only()
                 return
@@ -4366,6 +4467,19 @@ class CenterPanel(QWidget):
             if not offers:
                 # [2026-10 병역 7단계] 오퍼가 0건이어도 미필 20세 이상이면 군팀 카드만 있는 창을 띄운다.
                 if not _mil_due:
+                    return
+            else:
+                # [2026-11-20 신설, 신민용+GPT 확정 — 고가 매각 검토] 방금 온 오퍼 중 구단이 먼저 팔고 싶어질
+                # 만큼 큰 금액이 있으면 오퍼 창보다 먼저 구단이 매각 의사를 묻는다(창당 1회, 거절 불이익 없음).
+                # 수락하면 그 팀으로 이적이 예약되고 이번 오퍼 창은 띄우지 않는다(입대 카드는 그대로).
+                # 거절하면 평소처럼 오퍼 창이 뜬다(같은 오퍼도 그대로 고를 수 있음).
+                from game_engine import pick_high_value_sale
+                _hv = pick_high_value_sale(offers)
+                if _hv is not None and self._show_high_value_sale(_hv):
+                    self._auto_offer_shown = True
+                    self._show_military_only()
+                    if self.main_win:
+                        self.main_win.refresh_all()
                     return
 
         self._auto_offer_shown = True
@@ -4386,10 +4500,14 @@ class CenterPanel(QWidget):
             # 실제 이적은 다음 상/하반기 시작 주차에 실행된다. 이 구간
             # 안에서 더 좋은 오퍟를 다시 수락하면 자동으로 마지막 선택으로
             # 교체된다(reserve_join_transfer가 같은 필드를 덮어씀).
-            from game_engine import reserve_join_transfer
-            reserve_join_transfer(dlg.chosen["team_id"], dlg.chosen["salary"],
-                                  dlg.chosen.get("team_name", ""),
-                                  transfer_type="오퍼", offer=dlg.chosen)
+            from game_engine import reserve_join_transfer, transfer_request_state
+            _ok_res = reserve_join_transfer(dlg.chosen["team_id"], dlg.chosen["salary"],
+                                            dlg.chosen.get("team_name", ""),
+                                            transfer_type="오퍼", offer=dlg.chosen)
+            # [2026-11-21] 구단이 판매를 거절했으면 이적 요청으로 다시 요구할 수 있다고 알려준다.
+            if _ok_res is False and transfer_request_state()[0]:
+                show_toast(self, "🚫 구단이 이적을 거절했습니다 — '📣 이적 요청'으로 다시 요구할 수 있습니다",
+                           "#cc4400", 2600)
             if self.main_win: self.main_win.refresh_all()
 
     def _restore_pending_offer_window(self):
@@ -4429,9 +4547,9 @@ class CenterPanel(QWidget):
                 clear_pending_offer_state()
                 return
             # [버그수정 2026-07] 오퍼 창을 띄운 채(또는 뜨기 직전 상태로) 게임을
-            #   종료했다가, 재시작 전/후 사이에 토글을 껐다면 — 이적 요청 중이
-            #   아닌 한 그대로 복원하지 않고 정리한다. (기존엔 무조건 복원)
-            if not p.get("offers_enabled", 1) and not p.get("transfer_requested"):
+            #   종료했다가, 재시작 전/후 사이에 토글을 껐다면 그대로 복원하지
+            #   않고 정리한다. (기존엔 무조건 복원)
+            if not p.get("offers_enabled", 1):
                 clear_pending_offer_state()
                 return
             # [2026-11-01 신민용 승인 — 프리시즌 오퍼 1주차 제한] 입단한 이적 기간이면 복원하지 않는다(프리시즌 구간이 지난 상태는 load에서 이미 만료).

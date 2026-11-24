@@ -834,7 +834,9 @@ def simulate_my_po_match(week, p, day=None):
 
     _update_pop(p, goals, assists, rating)
     p2 = get_player()
-    ns = min(100, p2["stress"] + 20)
+    # [2026-11 통일] 리그와 같은 결과 기반 공식(game_engine.match_stress_gain) — 예전 +20 고정
+    from game_engine import match_stress_gain
+    ns = min(100, p2["stress"] + match_stress_gain(my_result))
     nh = p2["happiness"]
     if my_result == "win":
         nh = min(100, nh + 4)

@@ -1270,6 +1270,7 @@ def _award_player_briefs(conn, player_ids):
       · 없으면 은퇴(ai_players_retired): 마지막 소속팀 이름, 국적, 국기, 커스텀 이름
       · 나(MY_PLAYER_ID): get_ai_player_detail 그대로(한 명뿐)
       · 둘 다 없으면 빈 dict(예전 get_ai_player_detail(...) or {}와 같음)
+    [2026-11-22] position(주포 — 현역은 지금 주포지션, 은퇴는 은퇴 당시)도 같이 읽는다(기록 화면 "주포" 칸).
     반환 {player_id: dict}."""
     out = {}
     ids = sorted({int(p) for p in player_ids if p is not None})
@@ -1281,23 +1282,25 @@ def _award_player_briefs(conn, player_ids):
         ph = ",".join("?" * len(part))
         for r in conn.execute(
                 "SELECT p.id, p.nationality, nc.flag AS nat_flag, t.name AS team_name, "
-                "cust.custom_name FROM ai_players p "
+                "cust.custom_name, p.position FROM ai_players p "
                 "LEFT JOIN teams t ON p.team_id = t.id "
                 "LEFT JOIN countries nc ON nc.name = p.nationality "
                 "LEFT JOIN ai_player_custom_names cust ON cust.player_id = p.id "
                 f"WHERE p.id IN ({ph})", part).fetchall():
-            out[r[0]] = {"nationality": r[1], "nat_flag": r[2], "team_name": r[3], "custom_name": r[4]}
+            out[r[0]] = {"nationality": r[1], "nat_flag": r[2], "team_name": r[3], "custom_name": r[4],
+                         "position": r[5]}
         miss = [p for p in part if p not in out]
         if miss:
             ph2 = ",".join("?" * len(miss))
             for r in conn.execute(
                     "SELECT r.id, r.nationality, nc.flag AS nat_flag, r.last_team_name, "
-                    "cust.custom_name FROM ai_players_retired r "
+                    "cust.custom_name, r.position FROM ai_players_retired r "
                     "LEFT JOIN countries nc ON nc.name = r.nationality "
                     "LEFT JOIN ai_player_custom_names cust ON cust.player_id = r.id "
                     f"WHERE r.id IN ({ph2})", miss).fetchall():
                 if r[0] not in out:
-                    out[r[0]] = {"nationality": r[1], "nat_flag": r[2], "team_name": r[3], "custom_name": r[4]}
+                    out[r[0]] = {"nationality": r[1], "nat_flag": r[2], "team_name": r[3], "custom_name": r[4],
+                                 "position": r[5]}
     return out
 
 
@@ -5075,6 +5078,1067 @@ def get_world_award_winners_by_year(award_type):
     return out
 
 
+# [2026-11-22 신설, 신민용 요청: "역대 개인상 맨 윗줄 우측 끝에 기록 버튼 — 역대 발롱·야신상 2회 이상 받은 선수
+# 순위(얼마나 많이 받았는지), 세계상 버튼 안에 발롱·야신 표시(나중에 기록 추가 가능)"]
+# "기록" 화면의 묶음(버튼) → 그 안에 나란히 보여줄 상 목록. 다른 묶음·상을 붙일 때는 여기만 늘린다.
+AWARD_RECORD_GROUPS = (
+    ("alltime", "세계", ()),   # [2026-11-22] 세계 역대 순위(A매치 출전·득점·도움 / 모든 경기 통산 득점·도움 — get_world_alltime_records)
+    # [2026-11-23 신민용 요청] 세계상은 세 줄 — 발롱 | 야신 / FIFA | UEFA | 코메볼 / AFC | CAF | 콩카카프
+    # (OFC는 아시아에 합쳐져 따로 주지 않는다). 상 목록이 튜플의 튜플이면 줄마다 나눠 놓는다.
+    ("world", "세계상", (("발롱도르", "야신상"),
+                         ("FIFA 올해의 선수", "UEFA 올해의 선수", "코메볼 올해의 선수"),
+                         ("AFC 올해의 선수", "CAF 올해의 선수", "콩카카프 올해의 선수"))),
+    ("club", "클럽 대항전", ()),   # [2026-11-22] 챔스·유로파·컨퍼런스 대륙별 최다 득점·도움(get_club_comp_player_records)
+    ("league", "리그", ()),   # [2026-11-22] 리그 개인 기록(나라·부수별 최다 득점·도움 — get_league_player_records)
+)
+AWARD_RECORD_MIN_WINS = 2   # 이 횟수 이상 1위를 받은 선수만 표시
+
+
+def _dense_rank_cut(values, top_n):
+    """[2026-11-23 신민용 확정 — Dense 순위 표기] 정렬된 값 목록 → (표시 순위 목록, 남길 개수).
+    표시 순위는 Dense — 같은 값은 같은 순위, 다음 값은 바로 다음 순위(1, 2, 2, 3 …).
+    남기는 줄은 예전 그대로 — 표준 경쟁 순위(1, 2, 2, 4 …)가 top_n 이하인 줄까지(top_n 자리의 동점자는 전부).
+    Dense로 "10위"를 세면 기록 종류가 적은 표(게임 초반 등)에서 수천 줄이 될 수 있어 줄 수는 바꾸지 않는다.
+    top_n None = 자르지 않음."""
+    ranks = []
+    prev_v, prev_dense, prev_comp = object(), 0, 0
+    for i, v in enumerate(values):
+        if v == prev_v:
+            dense, comp = prev_dense, prev_comp
+        else:
+            dense, comp = prev_dense + 1, i + 1
+        if top_n is not None and comp > top_n:
+            break
+        prev_v, prev_dense, prev_comp = v, dense, comp
+        ranks.append(dense)
+    return ranks, len(ranks)
+
+
+def _multi_winner_rows(conn, years_by, min_wins, top_n):
+    """{선수: [수상 연도 오름차순]} → 다회 수상 표 행. min_wins회 이상만, 많이 받은 순, 횟수가 같으면 그 횟수에 먼저
+    도달한 선수(그 횟수째 수상 연도가 이른 선수)가 위(get_award_multi_winners·get_club_poty_multi_winners가 쓰던
+    규칙 그대로). 표시 순위는 Dense, 줄 자르기는 _dense_rank_cut(top_n None = 전원).
+    반환 [{rank, player_id, name, wins, years, nationality, nat_flag, position, team_name, retired}]."""
+    from constants import ai_player_code
+    picked = [(pid, ys) for pid, ys in years_by.items() if len(ys) >= min_wins]
+    if not picked:
+        return []
+    picked.sort(key=lambda t: (-len(t[1]), t[1][len(t[1]) - 1], t[1][0], t[0]))
+    ranks, n_keep = _dense_rank_cut([len(ys) for _pid, ys in picked], top_n)
+    picked = picked[:n_keep]
+    pids = [pid for pid, _ys in picked]
+    briefs = _award_player_briefs(conn, pids)
+    ai_ids = [p for p in pids if p != MY_PLAYER_ID]
+    active = set()
+    for k in range(0, len(ai_ids), 500):
+        part = ai_ids[k:k + 500]
+        ph = ",".join("?" * len(part))
+        active.update(r[0] for r in conn.execute(f"SELECT id FROM ai_players WHERE id IN ({ph})", part))
+    out = []
+    for (pid, ys), rank in zip(picked, ranks):
+        d = briefs.get(pid) or {}
+        if pid == MY_PLAYER_ID:
+            name = d.get("name") or "나"
+            retired = bool(d.get("is_retired"))
+        else:
+            name = d.get("custom_name") or ai_player_code(pid)
+            retired = pid not in active
+        out.append({"rank": rank, "player_id": pid, "name": name, "wins": len(ys), "years": list(ys),
+                    "nationality": d.get("nationality") or "", "nat_flag": d.get("nat_flag") or "",
+                    "position": d.get("position") or "",
+                    "team_name": d.get("team_name") or "", "retired": retired})
+    return out
+
+
+def _award_year_list_sql(conn):
+    """개인상 표에 있는 연도 전부를 SQL IN 목록 글자로("2000,2001,…") — 없으면 None. 최소·최대 연도는 연도 색인 끝값
+    조회 두 번(가볍다). 연도를 직접 적어 주면 (연도, 상 이름, 순위) 색인을 연도마다 바로 찾는다 — 통계(ANALYZE)가
+    없는 세이브에서도 표 전체를 훑지 않는다."""
+    lo = conn.execute("SELECT MIN(year) FROM hist.season_individual_awards").fetchone()[0]
+    hi = conn.execute("SELECT MAX(year) FROM hist.season_individual_awards").fetchone()[0]
+    if lo is None or hi is None:
+        return None
+    return ",".join(str(y) for y in range(int(lo), int(hi) + 1))
+
+
+# [2026-11-23] 다회 수상 표의 줄 자르기 — 예전부터 있던 발롱·야신은 2회 이상 전원(그대로), 새로 넣은 표
+# (FIFA·대륙 올해의 선수 등)는 기록 표와 같이 10위까지(RECORD_TOP_N, _dense_rank_cut). 여기 없는 상 = 10위까지.
+AWARD_MULTI_UNCUT = ("발롱도르", "야신상")
+
+
+def get_award_multi_winners_many(award_types, min_wins=AWARD_RECORD_MIN_WINS, top_n=None):
+    """[2026-11-23 신설] 여러 상의 다회 수상 순위를 조회 한 번으로 — {상 이름: get_award_multi_winners 형식 행}.
+    기록 → 세계상 표 8개(발롱·야신·FIFA·대륙 올해의 선수)를 채울 때 상마다 따로 읽지 않는다. 행 규칙은
+    _multi_winner_rows(1위(rank=1)만, 같은 해 중복 없이). top_n None = 상마다 기본값(AWARD_MULTI_UNCUT는 전원,
+    나머지는 RECORD_TOP_N), 숫자를 주면 모든 상에 그 값."""
+    award_types = list(award_types)
+    out = {a: [] for a in award_types}
+    if not award_types:
+        return out
+    conn = get_conn()
+    try:
+        ys = _award_year_list_sql(conn)
+        if ys is None:
+            return out
+        ph = ",".join("?" * len(award_types))
+        by = {a: {} for a in award_types}
+        for y, a, pid in conn.execute(
+                f"""SELECT DISTINCT year, award_type, player_id FROM hist.season_individual_awards
+                    WHERE year IN ({ys}) AND award_type IN ({ph}) AND rank=1 AND player_id IS NOT NULL""",
+                award_types).fetchall():
+            by[a].setdefault(pid, set()).add(y)
+        for a in award_types:
+            _tn = top_n if top_n is not None else (None if a in AWARD_MULTI_UNCUT else RECORD_TOP_N)
+            out[a] = _multi_winner_rows(conn, {p: sorted(v) for p, v in by[a].items()}, min_wins, _tn)
+        return out
+    finally:
+        conn.close()
+
+
+def get_award_multi_winners(award_type, min_wins=AWARD_RECORD_MIN_WINS, top_n=None):
+    """award_type 1위(rank=1)를 min_wins회 이상 받은 선수 순위 — 많이 받은 순. 횟수가 같으면 공동 순위
+    ([2026-11-23] 표시는 Dense — 1, 1, 2 …, 줄 자르기는 get_award_multi_winners_many 기본값)이고, 표시 순서는 그 횟수에 먼저 도달한 선수
+    (그 횟수째 수상 연도가 이른 선수)가 위.
+    이름은 다른 개인상 표와 같은 규칙(내 선수는 내 이름/"나", AI는 커스텀 이름 → 없으면 AI 코드)으로 조회
+    시점 최신 값을 쓴다. 국적·소속은 현재 값(은퇴 선수는 retired=True, 소속 칸은 UI가 "은퇴"로 표시).
+    position = 주포(현역은 지금 주포지션, 은퇴 선수는 은퇴 당시).
+    반환 [{rank, player_id, name, wins, years, nationality, nat_flag, position, team_name, retired}]."""
+    return get_award_multi_winners_many([award_type], min_wins, top_n)[award_type]
+
+
+# [2026-11-23 신설, 신민용 요청] 기록 → 클럽 대항전: 대회 MVP 다회 수상. 클럽 대항전 개인상 이름은
+# "{대륙} {대회} MVP"(game_engine._CLUB_COMP_TIER_LABEL과 같은 대회 이름 — 예: "유럽 챔피언스리그 MVP").
+CLUB_COMP_MVP_LABEL = {"cl": "챔피언스리그", "el": "유로파리그", "ecl": "컨퍼런스리그"}
+
+
+def get_club_comp_mvp_multi_winners(continent, comp, min_wins=AWARD_RECORD_MIN_WINS, top_n=None):
+    """그 대륙 그 대회(cl 챔피언스 / el 유로파 / ecl 컨퍼런스) MVP를 min_wins회 이상 받은 선수 순위 —
+    get_award_multi_winners와 같은 행·순위 규칙, top_n None = 10위까지(RECORD_TOP_N)."""
+    label = CLUB_COMP_MVP_LABEL.get(comp)
+    if not continent or not label:
+        return []
+    a = f"{continent} {label} MVP"
+    return get_award_multi_winners_many([a], min_wins, RECORD_TOP_N if top_n is None else top_n)[a]
+
+
+def get_league_mvp_multi_winners(country, tier, min_wins=AWARD_RECORD_MIN_WINS, top_n=None):
+    """[2026-11-23 신설, 신민용 요청] 역대 개인상 → 기록 → 리그: 그 나라 tier부 리그 MVP를 min_wins회 이상 받은
+    선수 순위(get_award_multi_winners와 같은 행·순위 규칙). 리그 MVP는 리그 개인상(category='league', 그 해 그
+    리그 나라·부수, award_kind='MVP')으로 저장된다 — 같은 부수에 리그가 여럿이면 합쳐 센다. (분류, 연도, 나라, 부수)
+    색인을 연도마다 바로 찾는다. top_n None = RECORD_TOP_N(10위)."""
+    if not country or tier is None:
+        return []
+    top_n = RECORD_TOP_N if top_n is None else top_n
+    conn = get_conn()
+    try:
+        ys = _award_year_list_sql(conn)
+        if ys is None:
+            return []
+        by = {}
+        for y, pid in conn.execute(
+                f"""SELECT DISTINCT year, player_id FROM hist.season_individual_awards
+                    WHERE category='league' AND year IN ({ys}) AND league_country=? AND league_tier=?
+                      AND award_kind='MVP' AND rank=1 AND player_id IS NOT NULL""",
+                (country, int(tier))).fetchall():
+            by.setdefault(pid, set()).add(y)
+        return _multi_winner_rows(conn, {p: sorted(v) for p, v in by.items()}, min_wins, top_n)
+    finally:
+        conn.close()
+
+
+# [2026-11-22 신설, 신민용 요청] 선수 기록 순위 — ① 국가 검색 "기록" 버튼: 그 나라 A매치 최다 출전·득점·도움
+# ② 역대 개인상 기록 → "리그": 나라·부수별 리그 최다 득점·도움. 둘 다 1~10위(같은 값은 같은 순위, 10위 동점자까지
+# 전부 표시 — 그래서 10명보다 많을 수 있다), 값이 0인 선수는 넣지 않는다.
+RECORD_TOP_N = 10
+LEAGUE_RECORD_DEFAULT_COUNTRIES = ("잉글랜드", "스페인", "프랑스", "이탈리아", "독일", "대한민국")
+
+
+def _record_rank_pick(totals, top_n=RECORD_TOP_N):
+    """totals {player_id: 값} → [(순위, player_id, 값)] — 값 내림차순, 순위 top_n 이하만(동점자 포함), 값 0 제외.
+    같은 값은 player_id 순(내 선수 MY_PLAYER_ID=-1은 동점 중 맨 위).
+    [2026-11-23 신민용 확정] 표시 순위는 Dense(1, 2, 2, 3 …) — 예전 표준 경쟁 순위(1, 2, 2, 4 …)에서 바꿨다. 값·순서·
+    남는 줄은 그대로(_dense_rank_cut)."""
+    items = sorted(((v, pid) for pid, v in totals.items() if (v or 0) > 0), key=lambda t: (-t[0], t[1]))
+    ranks, n_keep = _dense_rank_cut([v for v, _pid in items], top_n)
+    return [(rank, pid, v) for rank, (v, pid) in zip(ranks, items[:n_keep])]
+
+
+def _record_rank_lists(conn, totals_by_key, top_n=RECORD_TOP_N):
+    """{키: totals} → {키: [{rank, player_id, name, value, nationality, nat_flag, position, team_name, retired}]}.
+    position = 주포(_award_player_briefs — 현역은 지금 주포지션, 은퇴 선수는 은퇴 당시).
+    이름·국적은 개인상 표와 같은 규칙(_award_player_briefs) — 여러 표에 나온 선수를 한 번에 조회한다
+    (내 선수 상세 조회도 한 번)."""
+    picks = {k: [(r_, pid, v, None) for r_, pid, v in _record_rank_pick(t, top_n)] for k, t in totals_by_key.items()}
+    return _record_rows_from_picks(conn, picks)
+
+
+def _record_rows_from_picks(conn, picks):
+    """{키: [(순위, player_id, 값, 덧붙일 칸 dict 또는 None)]} → _record_rank_lists 행 형식(덧붙일 칸은 행에 더한다 —
+    단일 시즌 표의 "year"). 여러 표에 나온 선수의 이름·국적·주포를 한 번에 조회한다."""
+    from constants import ai_player_code
+    pids = sorted({pid for lst in picks.values() for _r, pid, _v, _x in lst})
+    briefs = _award_player_briefs(conn, pids) if pids else {}
+    ai_ids = [p for p in pids if p != MY_PLAYER_ID]
+    active = set()
+    for k in range(0, len(ai_ids), 500):
+        part = ai_ids[k:k + 500]
+        ph = ",".join("?" * len(part))
+        active.update(r[0] for r in conn.execute(f"SELECT id FROM ai_players WHERE id IN ({ph})", part))
+    out = {}
+    for key, lst in picks.items():
+        rows = []
+        for rank, pid, v, extra in lst:
+            d = briefs.get(pid) or {}
+            if pid == MY_PLAYER_ID:
+                name, retired = d.get("name") or "나", bool(d.get("is_retired"))
+            else:
+                name, retired = d.get("custom_name") or ai_player_code(pid), pid not in active
+            row = {"rank": rank, "player_id": pid, "name": name, "value": v,
+                   "nationality": d.get("nationality") or "", "nat_flag": d.get("nat_flag") or "",
+                   "position": d.get("position") or "",
+                   "team_name": d.get("team_name") or "", "retired": retired}
+            if extra:
+                row.update(extra)
+            rows.append(row)
+        out[key] = rows
+    return out
+
+
+def _record_rank_rows(conn, totals, top_n=RECORD_TOP_N):
+    """표 하나짜리 _record_rank_lists."""
+    return _record_rank_lists(conn, {0: totals}, top_n)[0]
+
+
+def _record_stamp(conn):
+    """기록 캐시 키 — 지난 시즌 기록이 새로 쌓였는지. 시즌 기록(리그·대회 골 스냅샷)은 오프시즌에 OVR 이력과 같이
+    쌓이므로 OVR 이력 최대 연도(인덱스 끝값 조회)와 현재 연도·내 시즌 기록 수로 판정한다(전부 가벼운 조회)."""
+    try:
+        hy = conn.execute("SELECT MAX(year) FROM hist.ai_player_ovr_history").fetchone()[0]
+    except Exception:
+        hy = None
+    try:
+        cy = conn.execute("SELECT current_year FROM season_state WHERE id=1").fetchone()
+        cy = cy[0] if cy else None
+    except Exception:
+        cy = None
+    try:
+        mn = conn.execute("SELECT COUNT(*), MAX(year) FROM my_player_season_stats").fetchone()
+        mn = tuple(mn) if mn else None
+    except Exception:
+        mn = None
+    return (hy, cy, mn)
+
+
+_AMATCH_PAST_CACHE = {}   # (나라 또는 None=세계, 올림픽 포함) → (기록 시점 키, 지난해까지 대회의 {player_id: (출전, 득점, 도움)})
+
+
+def _intl_totals(conn, country=None, include_olympic=False):
+    """국가대표 통산 (출전, 득점, 도움) — ({선수: 출전}, {선수: 득점}, {선수: 도움}), 내 선수(MY_PLAYER_ID) 포함.
+    country: 그 나라 대표로 뛴 기록만(None이면 전 세계 — 선수별로 모든 나라 기록 합산).
+    include_olympic: False = A매치(U-23 올림픽 예선·본선 제외), True = 국가대표 모든 경기.
+    출전 = 실제로 뛴 경기(intl_squad.appearances — 선발·교체 투입 모두, 명단에만 있고 안 뛴 경기는 0).
+    득점·도움 = 대회가 끝날 때 채워지는 대회별 기록. 내 선수도 같은 시점에 맞춰, 그 대회 AI 기록이 채워진(평점 스냅샷이
+    된) 대회만 골·도움을 더한다(출전은 바로).
+    [속도] 지난해까지 대회 몫은 (나라, 올림픽) 별로 한 번 읽어 두고(오프시즌에 새 기록이 쌓이면 다시), 올해 대회
+    몫만 매번 대회 id로 바로 찾아 더한다(intl_squad 기본 키 앞부분)."""
+    from competition.olympics import olympic_tournament_ids
+    oly = set() if include_olympic else olympic_tournament_ids(conn)
+    _oly_sql = f" AND tournament_id NOT IN ({','.join(str(int(i)) for i in sorted(oly))})" if oly else ""
+    _c_sql, _c_arg = (" AND country=?", (country,)) if country is not None else ("", ())
+    cy = conn.execute("SELECT current_year FROM season_state WHERE id=1").fetchone()
+    cy = cy[0] if cy and cy[0] is not None else 10 ** 9
+    stamp = _record_stamp(conn)
+    key = (country, bool(include_olympic))
+    hit = _AMATCH_PAST_CACHE.get(key)
+    if hit is not None and hit[0] == stamp:
+        past = hit[1]
+    else:
+        past = {}
+        for pid, a, g, s_ in conn.execute(
+                "SELECT player_id, SUM(appearances), SUM(goals), SUM(assists) FROM intl_squad "
+                "WHERE appearances>0" + _c_sql + _oly_sql +
+                " AND tournament_id IN (SELECT id FROM intl_tournaments WHERE year<?) GROUP BY player_id",
+                (*_c_arg, cy)).fetchall():
+            past[pid] = (a or 0, g or 0, s_ or 0)
+        _AMATCH_PAST_CACHE[key] = (stamp, past)
+    caps = {p: v[0] for p, v in past.items()}
+    goals = {p: v[1] for p, v in past.items()}
+    assists = {p: v[2] for p, v in past.items()}
+    cur_t = [r[0] for r in conn.execute("SELECT id FROM intl_tournaments WHERE year>=?", (cy,)).fetchall()
+             if r[0] not in oly]
+    for k in range(0, len(cur_t), 500):
+        part = cur_t[k:k + 500]
+        ph = ",".join("?" * len(part))
+        for pid, a, g, s_ in conn.execute(
+                f"SELECT player_id, SUM(appearances), SUM(goals), SUM(assists) FROM intl_squad "
+                f"WHERE tournament_id IN ({ph}) AND appearances>0{_c_sql} GROUP BY player_id",
+                (*part, *_c_arg)).fetchall():
+            caps[pid] = caps.get(pid, 0) + (a or 0)
+            goals[pid] = goals.get(pid, 0) + (g or 0)
+            assists[pid] = assists.get(pid, 0) + (s_ or 0)
+    try:
+        mine = [r for r in _my_intl_record_rows(conn.cursor())
+                if (country is None or r["country"] == country) and r["tournament_id"] not in oly and r["appearances"]]
+        if mine:
+            _tids = sorted({r["tournament_id"] for r in mine})
+            snap = set()
+            for k in range(0, len(_tids), 500):
+                part = _tids[k:k + 500]
+                ph = ",".join("?" * len(part))
+                snap.update(r[0] for r in conn.execute(
+                    f"SELECT DISTINCT tournament_id FROM intl_squad WHERE tournament_id IN ({ph}) AND rating>0", part))
+            for r in mine:
+                caps[MY_PLAYER_ID] = caps.get(MY_PLAYER_ID, 0) + r["appearances"]
+                if r["tournament_id"] in snap:
+                    goals[MY_PLAYER_ID] = goals.get(MY_PLAYER_ID, 0) + (r["goals"] or 0)
+                    assists[MY_PLAYER_ID] = assists.get(MY_PLAYER_ID, 0) + (r["assists"] or 0)
+    except Exception:
+        pass
+    return caps, goals, assists
+
+
+# [2026-11-23 신설, 신민용 확정] 기록 표 선수 줄 아래 "활동 기간 | N년" 줄 — 표에 나온 선수만 계산해 행에
+# "period"(글자)·"period_years"(연수)를 덧붙인다(순위·값은 그대로).
+#   · 국가대표(A매치 표): 최초 소집 연도 ~ 마지막 소집 연도 — 소집 = 대회 최종 명단(intl_squad, 안 뛰어도 소집),
+#     후보 탈락은 소집 아님, U-23 올림픽 제외, 중간 공백은 끊지 않는다, 연수 = 끝 - 처음 + 1. 은퇴 선언 연도와 무관.
+#   · 클럽(클럽 기록 표): 그 클럽 소속 연도 — 시즌 기록의 팀(시즌 중 이적한 해는 반기 조각으로 양쪽 팀 모두,
+#     임대는 임대 간 팀), 지금 그 팀 소속이면 올해까지 "~현재". 떠났다 돌아오면 구간을 나누고 연수는 소속 연도 수.
+
+def _period_text(years, current=False):
+    """정렬된 연도 목록 → "2002~2005, 2007~2009"(연속 구간), current면 마지막 구간 끝을 "현재"로."""
+    ys = sorted(set(years))
+    if not ys:
+        return ""
+    runs = [[ys[0], ys[0]]]
+    for y in ys[1:]:
+        if y == runs[-1][1] + 1:
+            runs[-1][1] = y
+        else:
+            runs.append([y, y])
+    parts = []
+    for i, (a, b) in enumerate(runs):
+        last = i == len(runs) - 1
+        if last and current:
+            parts.append(f"{a}~현재")
+        else:
+            parts.append(f"{a}~{b}" if a != b else str(a))
+    return ", ".join(parts)
+
+
+def _intl_call_spans(conn, pids, country=None):
+    """{선수: (최초 소집 연도, 마지막 소집 연도)} — A매치(U-23 올림픽 제외) 최종 명단 기준. country None = 모든 나라.
+    표에 나온 선수만 읽는다(intl_squad 기본 키의 선수 칸 — 선수 검색 통산 줄과 같은 조회)."""
+    from competition.olympics import olympic_tournament_ids
+    oly = olympic_tournament_ids(conn)
+    tyear = {tid: y for tid, y in conn.execute("SELECT id, year FROM intl_tournaments").fetchall()}
+    out = {}
+
+    def _add(pid, y):
+        if y is None:
+            return
+        a, b = out.get(pid, (y, y))
+        out[pid] = (min(a, y), max(b, y))
+    ai = sorted({int(p) for p in pids if p is not None and p != MY_PLAYER_ID})
+    _c_sql, _c_arg = (" AND country=?", (country,)) if country is not None else ("", ())
+    for k in range(0, len(ai), 200):
+        part = ai[k:k + 200]
+        ph = ",".join("?" * len(part))
+        for pid, tid in conn.execute(f"SELECT player_id, tournament_id FROM intl_squad "
+                                     f"WHERE player_id IN ({ph}){_c_sql}", (*part, *_c_arg)).fetchall():
+            if tid not in oly:
+                _add(pid, tyear.get(tid))
+    if MY_PLAYER_ID in pids:
+        try:
+            for r in _my_intl_record_rows(conn.cursor()):
+                if r["tournament_id"] not in oly and (country is None or r["country"] == country):
+                    _add(MY_PLAYER_ID, r["year"])
+        except Exception:
+            pass
+    return out
+
+
+def _attach_intl_periods(conn, lists, country=None):
+    """lists = {키: 표 행 목록} — 각 행에 국가대표 활동 기간(period, period_years)을 단다."""
+    pids = {r["player_id"] for lst in lists.values() for r in lst}
+    if not pids:
+        return
+    spans = _intl_call_spans(conn, pids, country)
+    for lst in lists.values():
+        for r in lst:
+            s = spans.get(r["player_id"])
+            if s:
+                r["period"] = f"{s[0]}~{s[1]}" if s[0] != s[1] else str(s[0])
+                r["period_years"] = s[1] - s[0] + 1
+
+
+def _club_member_years(conn, team_id, pids):
+    """{선수: ([소속 연도…], 지금 소속 여부)} — 그 클럽에 소속됐던 해. 지난 시즌까지는 시즌 기록(시즌을 마친 팀 +
+    시즌 중 이적생 반기 조각 — 임대는 임대 간 팀으로 저장된다), 올해는 지금 소속이거나 올해 겨울에 이 팀에서 떠났으면."""
+    team_id = int(team_id)
+    out = {}
+    try:
+        _r = conn.execute("SELECT current_year FROM season_state WHERE id=1").fetchone()
+        cy = _r[0] if _r and _r[0] is not None else None
+    except Exception:
+        cy = None
+    ai = sorted({int(p) for p in pids if p is not None and p != MY_PLAYER_ID})
+    for k in range(0, len(ai), 200):
+        part = ai[k:k + 200]
+        ph = ",".join("?" * len(part))
+        for sql in (f"SELECT player_id, year FROM hist.ai_player_season_stats WHERE player_id IN ({ph}) AND team_id=?",
+                    f"SELECT player_id, year FROM hist.ai_player_season_team_stats WHERE team_id=? AND player_id IN ({ph})"):
+            args = (*part, team_id) if sql.endswith("team_id=?") else (team_id, *part)
+            try:
+                for pid, y in conn.execute(sql, args).fetchall():
+                    out.setdefault(pid, [set(), False])[0].add(y)
+            except Exception:
+                pass
+        for (pid,) in conn.execute(f"SELECT id FROM ai_players WHERE id IN ({ph}) AND team_id=?",
+                                   (*part, team_id)).fetchall():
+            e = out.setdefault(pid, [set(), False])
+            e[1] = True
+            if cy is not None:
+                e[0].add(cy)
+        if cy is not None:
+            try:
+                for (pid,) in conn.execute(
+                        f"SELECT player_id FROM ai_transfer_log WHERE player_id IN ({ph}) AND year=? "
+                        f"AND is_mid_season=1 AND from_team_id=?", (*part, cy, team_id)).fetchall():
+                    out.setdefault(pid, [set(), False])[0].add(cy)
+            except Exception:
+                pass
+    if MY_PLAYER_ID in pids:
+        ys = {y for y, t, _g, _a in _my_league_season_rows(conn) if t == team_id}
+        cur = False
+        try:
+            r = conn.execute("SELECT current_team_id FROM my_player WHERE id=1").fetchone()
+            cur = bool(r and r[0] == team_id)
+        except Exception:
+            pass
+        if cur and cy is not None:
+            ys.add(cy)
+        if ys:
+            out[MY_PLAYER_ID] = [ys, cur]
+    return {p: (sorted(v[0]), v[1]) for p, v in out.items() if v[0]}
+
+
+def _attach_club_periods(conn, team_id, lists):
+    pids = {r["player_id"] for lst in lists.values() for r in lst}
+    if not pids:
+        return
+    yrs = _club_member_years(conn, team_id, pids)
+    for lst in lists.values():
+        for r in lst:
+            v = yrs.get(r["player_id"])
+            if v:
+                r["period"] = _period_text(v[0], current=v[1])
+                r["period_years"] = len(v[0])
+
+
+def get_club_tenure_records(team_id, top_n=RECORD_TOP_N):
+    """[2026-11-24 신설, 신민용 요청: 구단 기록 "최다 기간"] 그 구단에 가장 오래 소속된 선수 1~10위(같은 연수는 같은
+    순위, 10위 동점자까지) — [{rank, player_id, name, value(연수), …, period, period_years}](_record_rank_lists 형식).
+    연수·기간은 선수 줄 아래 기간 줄과 같은 규칙(_club_member_years: 시즌 기록의 팀 + 반기 조각, 임대는 임대 간 팀,
+    지금 소속이면 올해까지 "~현재"). 시즌 기록 표는 팀으로 찾을 색인이 없어 전체를 훑지 않고, 그 구단에 있었던 선수
+    후보만 모아 선수 id로 찾는다 — 후보 = 그 구단 통산 골·도움 장부 선수 ∪ 지금 선수단 ∪ 그 구단에서 은퇴한 선수 ∪
+    그 구단에서 다른 팀으로 나간 이적 기록(보관 기록 포함) ∪ 내 선수. 표시 전용(게임 로직 무관)."""
+    import record_ledger as _RL
+    conn = get_conn()
+    try:
+        tid = int(team_id)
+        cand = set()
+        try:
+            g, a = _RL.scope_totals(conn, _RL.SCOPE_CLUB, str(tid))
+            cand |= set(g) | set(a)
+        except Exception:
+            pass
+        cand |= {r[0] for r in conn.execute("SELECT id FROM ai_players WHERE team_id=?", (tid,)).fetchall()}
+        _tn = conn.execute("SELECT name FROM teams WHERE id=?", (tid,)).fetchone()
+        if _tn:
+            try:
+                cand |= {r[0] for r in conn.execute(
+                    "SELECT id FROM ai_players_retired WHERE last_team_name=? AND last_team_id=?", (_tn[0], tid)).fetchall()}
+            except Exception:
+                pass
+        for _tbl in ("ai_transfer_log", "ai_transfer_log_archive"):
+            try:
+                cand |= {r[0] for r in conn.execute(
+                    f"SELECT DISTINCT player_id FROM {_tbl} WHERE from_team_id=?", (tid,)).fetchall()}
+            except Exception:
+                pass
+        cand.discard(None)
+        cand.add(MY_PLAYER_ID)
+        yrs = _club_member_years(conn, tid, cand)
+        out = _record_rank_rows(conn, {p: len(v[0]) for p, v in yrs.items()}, top_n)
+        for r in out:
+            v = yrs.get(r["player_id"])
+            if v:
+                r["period"] = _period_text(v[0], current=v[1])
+                r["period_years"] = len(v[0])
+        return out
+    finally:
+        conn.close()
+
+
+def get_country_amatch_records(country, top_n=RECORD_TOP_N):
+    """그 나라 A매치 개인 기록 — {"caps": [...], "goals": [...], "assists": [...]}(_record_rank_lists 형식, value = 값).
+    A매치 범위 = 월드컵·대륙컵·지역컵·네이션스컵 본선과 예선·랭킹 평가전, U-23 올림픽(예선·본선)은 뺀다
+    (통산 A매치 출전 get_player_total_intl_appearances와 같은 기준). 그 나라 대표로 뛴 기록만 센다(복수 국적 선수의
+    다른 나라 기록은 제외). 집계 규칙은 _intl_totals."""
+    conn = get_conn()
+    try:
+        caps, goals, assists = _intl_totals(conn, country, include_olympic=False)
+        out = _record_rank_lists(conn, {"caps": caps, "goals": goals, "assists": assists}, top_n)
+        _attach_intl_periods(conn, out, country)   # [2026-11-23] 선수 줄 아래 국가대표 활동 기간
+        return out
+    finally:
+        conn.close()
+
+
+# [2026-11-22 변경, 신민용 승인] 기록 화면(세계·리그·클럽 대항전)과 팀 검색 "클럽 기록"의 AI 선수 통산은 기록 전용
+# 통산 장부(hist.record_totals — record_ledger.py)에서 범위 키로 바로 읽는다. 예전엔 화면을 처음 열 때마다 시즌 기록
+# 표 전체를 훑었다(40시즌 1~3초). 내 선수 기록은 본 DB에 있어(시즌·경기 기록) 여기서 바로 더한다.
+
+def _record_part_applied(conn, year, part):
+    """장부에 그 해 그 부분(리그 'league' / 대회 'comp:<대회>')이 이미 더해졌는지 — 내 선수 기록을 AI와 같은
+    시점까지만 더할 때 쓴다."""
+    try:
+        return conn.execute("SELECT 1 FROM hist.record_applied WHERE year=? AND part=?",
+                            (int(year), part)).fetchone() is not None
+    except Exception:
+        return False
+
+
+def _my_club_contribs(conn):
+    """[2026-11-24 신설] 내 선수 클럽 기록 조각 [(연도, 팀 id, 골, 도움, 부분)] — 부분 'league' 또는 대회 키
+    ('cup'·'cl'·'sc'·'cwc'·'lower_cup'·'dsc' — 통산 장부 부분 이름 'comp:<키>'와 같다). 기록 화면의 내 선수 몫은
+    전부 이것으로 센다(세계 통산·단일 시즌·클럽 기록·리그 기록).
+    AI와 같은 시점까지만 넣는다 — AI 기록은 그 해 리그·대회 기록을 저장하는 순간(43주, 클럽월드컵은 52주 끝) 장부에
+    더해진다. 예전엔 내 선수만 ① 올해 대회 기록을 해가 바뀔 때까지 빼고(43~52주에 AI보다 한 시즌 늦었다) ② 올해 리그는
+    시즌 끝 기록(my_player_season_stats)이 해가 바뀔 때 쓰여서 역시 빠졌고 ③ 시즌 중 떠난 팀 몫(career_entries)은
+    시즌 도중에도 바로 들어갔다(AI는 43주에야 들어감).
+      · 지난 해까지: 전부.
+      · 올해: 장부에 그 해 그 부분이 더해졌을 때만(_record_part_applied). 올해 리그의 지금 팀 몫은 아직 시즌 끝 기록이
+        없으니 지금 시즌 기록(my_player.season_* — 이적하면 0으로 리셋, 리그 경기만)으로 센다.
+    대회 기록에 팀이 안 적힌 옛 경기(team 0)는 그 해 시즌을 마친 팀 몫."""
+    out = []
+    try:
+        _r = conn.execute("SELECT current_year FROM season_state WHERE id=1").fetchone()
+        cy = _r[0] if _r and _r[0] is not None else 10 ** 9
+    except Exception:
+        cy = 10 ** 9
+    _ok = {}
+
+    def done(y, part):
+        if y < cy:
+            return True
+        k = (y, part)
+        if k not in _ok:
+            _ok[k] = _record_part_applied(conn, y, part)
+        return _ok[k]
+
+    final = {}
+    try:
+        for y, t, g, a in conn.execute("SELECT year, team_id, goals, assists FROM my_player_season_stats").fetchall():
+            final[y] = t
+            if done(y, "league"):
+                out.append((y, t, g or 0, a or 0, "league"))
+    except Exception:
+        return out
+    cur_tid = None
+    try:
+        mp = conn.execute("SELECT current_team_id, season_goals, season_assists, season_matches "
+                          "FROM my_player WHERE id=1").fetchone()
+        if mp is not None:
+            cur_tid = mp[0] or None
+            if cy not in final and cur_tid and (mp[3] or 0) > 0 and done(cy, "league"):
+                out.append((cy, cur_tid, mp[1] or 0, mp[2] or 0, "league"))
+            if cy not in final and cur_tid:
+                final[cy] = cur_tid
+    except Exception:
+        pass
+    try:
+        for y, t, g, a in conn.execute(
+                "SELECT end_year, team_id, goals, assists FROM career_entries "
+                "WHERE end_year>0 AND team_id>0 AND COALESCE(matches,0)>0").fetchall():
+            if y in final and t != final[y] and done(y, "league"):
+                out.append((y, t, g or 0, a or 0, "league"))
+    except Exception:
+        pass
+    try:
+        for y, td in get_my_club_comp_stats().items():
+            for tid, comps in td.items():
+                for comp, cs in comps.items():
+                    if done(y, f"comp:{comp}"):
+                        out.append((y, tid or final.get(y), cs.get("goals") or 0, cs.get("assists") or 0, comp))
+    except Exception:
+        pass
+    return out
+
+
+def _my_alltime_club_totals(conn):
+    """내 선수 클럽 통산 (골, 도움) — 리그(시즌 중 이적 몫 포함) + 국내컵·클럽 대항전·슈퍼컵·클럽월드컵 등(경기 실측).
+    AI 장부와 같은 시점까지(_my_club_contribs)."""
+    g = a = 0
+    for _y, _t, gg, aa, _k in _my_club_contribs(conn):
+        g += gg
+        a += aa
+    return g, a
+
+
+def _world_top_with_intl(conn, col, intl, mine, top_n):
+    """세계 통산 상위(1~top_n위, 동점 포함) 후보와 정확한 값 {선수: 값} — AI 클럽 통산(장부 세계 범위) + 국가대표
+    (intl {선수: 값}) + 내 선수(mine). 장부 상위 k명 ∪ 국가대표 상위 k명만 정확히 더한다 — 후보 밖 선수는
+    (장부 k번째 값 + 국가대표 k번째 값) 이하라, 10위 값이 그보다 크면 순위가 정확하다. 아니면 k를 4배로(드묾)."""
+    import record_ledger as _RL
+    k = 40
+    ivals = sorted(intl.values(), reverse=True)
+    while True:
+        top = _RL.top_world(conn, col, k)
+        ckth = top[-1][1] if len(top) >= k else 0
+        ikth = ivals[k - 1] if len(ivals) >= k else 0
+        cand = {p for p, _v in top}
+        cand |= {p for p, _v in sorted(intl.items(), key=lambda t: -t[1])[:k]}
+        cand.discard(MY_PLAYER_ID)
+        wv = _RL.world_values(conn, cand)
+        ci = 0 if col == "goals" else 1
+        tot = {p: (wv.get(p, (0, 0))[ci] or 0) + intl.get(p, 0) for p in cand}
+        tot[MY_PLAYER_ID] = mine + intl.get(MY_PLAYER_ID, 0)
+        vals = sorted((v for v in tot.values() if v > 0), reverse=True)
+        tenth = vals[top_n - 1] if len(vals) >= top_n else 0
+        if tenth > ckth + ikth or (len(top) < k and len(ivals) < k) or k >= 20000:
+            return tot
+        k *= 4
+
+
+def get_world_alltime_records(top_n=RECORD_TOP_N):
+    """역대 개인상 → 기록 → "세계": 전 세계 역대 순위(1~10위, 같은 값은 같은 순위, 10위 동점자까지).
+    {"caps"/"goals"/"assists": A매치 출전·득점·도움(올림픽 제외, 선수별로 모든 나라 대표 기록 합산),
+     "all_goals"/"all_assists": 모든 경기 통산 득점·도움(리그·국내컵·클럽 대항전·슈퍼컵·클럽월드컵·국가대표,
+     올림픽 포함)}. 리그·클럽 대회는 시즌이 끝난 기록까지, 국가대표 골·도움은 대회가 끝난 기록까지.
+    AI 클럽 통산은 통산 장부의 세계 범위(색인으로 상위만), 국가대표는 _intl_totals(지난해 몫 캐시)."""
+    conn = get_conn()
+    try:
+        caps, goals, assists = _intl_totals(conn, None, include_olympic=False)
+        _c_all, g_all, a_all = _intl_totals(conn, None, include_olympic=True)
+        mg, ma = _my_alltime_club_totals(conn)
+        tg = _world_top_with_intl(conn, "goals", g_all, mg, top_n)
+        ta = _world_top_with_intl(conn, "assists", a_all, ma, top_n)
+        out = _record_rank_lists(conn, {"caps": caps, "goals": goals, "assists": assists,
+                                        "all_goals": tg, "all_assists": ta}, top_n)
+        # [2026-11-23] A매치 세 표만 선수 줄 아래 국가대표 활동 기간(모든 나라 대표 소집 합산)
+        _attach_intl_periods(conn, {k: out[k] for k in ("caps", "goals", "assists")}, None)
+        return out
+    finally:
+        conn.close()
+
+
+def get_world_season_records(top_n=RECORD_TOP_N):
+    """[2026-11-24 신설, 신민용 요청] 역대 개인상 → 기록 → "세계": 단일 시즌 최다 득점·도움 —
+    {"season_goals": [...], "season_assists": [...]}(_record_rank_lists 행 + "year"). 한 줄 = 선수 한 명의 한 시즌이라
+    같은 선수가 여러 번 나올 수 있다. 시즌 기록 = 그 해 리그 + 모든 클럽 대회(국내컵·클럽 대항전·슈퍼컵·클럽월드컵·
+    하위컵·국내슈퍼컵), A매치·올림픽 등 국가대표는 뺀다. 시즌 중 이적하면 두 팀 기록을 합친다. 시즌이 끝난 기록까지
+    (AI는 통산 장부 단일 시즌 범위 — 부분 색인으로 상위만, 내 선수는 _my_club_contribs). 1~top_n위(Dense 표시,
+    top_n 자리 동점까지 — _dense_rank_cut), 같은 기록은 이른 시즌이 위."""
+    import record_ledger as _RL
+    conn = get_conn()
+    try:
+        if not _RL.season_ready(conn):
+            # 예전 세이브를 처음 불러온 직후 — 단일 시즌 기록을 뒤에서 한 번 모으는 중. 기다리지 않고 "모으는 중"으로 둔다.
+            return {"season_goals": [], "season_assists": [], "pending": True}
+        mine = {}
+        for y, _t, g, a, _k in _my_club_contribs(conn):
+            m = mine.setdefault(y, [0, 0])
+            m[0] += g
+            m[1] += a
+        picks = {}
+        for key, col, ci in (("season_goals", "goals", 0), ("season_assists", "assists", 1)):
+            my_e = [(MY_PLAYER_ID, y, v[ci]) for y, v in mine.items() if v[ci] > 0]
+            ent = _RL.top_season(conn, col, k=top_n) + my_e
+            ent.sort(key=lambda e: -e[2])
+            if len(ent) >= top_n:   # top_n번째 값과 같은 기록까지 전부(동점) — 그 값 이상을 색인으로 다시 뽑는다
+                ent = _RL.top_season(conn, col, min_value=ent[top_n - 1][2]) + my_e
+            ent.sort(key=lambda e: (-e[2], e[1], e[0]))
+            ranks, n = _dense_rank_cut([e[2] for e in ent], top_n)
+            picks[key] = [(r_, pid, v, {"year": y}) for r_, (pid, y, v) in zip(ranks, ent[:n])]
+        return _record_rows_from_picks(conn, picks)
+    finally:
+        conn.close()
+
+
+def get_player_career_totals(player_id):
+    """[2026-11-23 신설, 신민용 요청] 선수 검색 상세 "통산" 한 줄 — {"goals", "assists", "caps", "intl_goals",
+    "intl_assists"}. 역대 개인상 → 기록 → 세계 표(get_world_alltime_records)와 같은 기준이라 그 표에 나온 선수는
+    숫자가 같다:
+      · 통산 득점·도움 = 클럽(리그 + 모든 클럽 대회, 시즌이 끝난 기록까지 — AI는 통산 장부 세계 범위, 내 선수는
+        _my_alltime_club_totals) + 국가대표 모든 경기(올림픽 포함, 대회가 끝난 기록까지).
+      · A매치 출전·득점·도움 = 올림픽 예선·본선 제외, 실제로 뛴 경기(교체 투입 포함), 여러 나라 대표 기록 합산.
+    국가대표 집계 규칙은 _intl_totals와 같다(그 선수 줄만 읽는다 — intl_squad 기본 키의 선수 칸으로 찾는다).
+    진행 중인 시즌의 클럽 기록은 넣지 않는다."""
+    from competition.olympics import olympic_tournament_ids
+    out = {"goals": 0, "assists": 0, "caps": 0, "intl_goals": 0, "intl_assists": 0}
+    conn = get_conn()
+    try:
+        oly = olympic_tournament_ids(conn)
+        ig_all = ia_all = 0
+        if player_id == MY_PLAYER_ID:
+            cg, ca = _my_alltime_club_totals(conn)
+            try:
+                mine = [r for r in _my_intl_record_rows(conn.cursor()) if r["appearances"]]
+                if mine:
+                    _tids = sorted({r["tournament_id"] for r in mine})
+                    snap = set()
+                    for k in range(0, len(_tids), 500):
+                        part = _tids[k:k + 500]
+                        ph = ",".join("?" * len(part))
+                        snap.update(r[0] for r in conn.execute(
+                            f"SELECT DISTINCT tournament_id FROM intl_squad WHERE tournament_id IN ({ph}) AND rating>0",
+                            part))
+                    for r in mine:
+                        g_ = (r["goals"] or 0) if r["tournament_id"] in snap else 0
+                        a_ = (r["assists"] or 0) if r["tournament_id"] in snap else 0
+                        ig_all += g_
+                        ia_all += a_
+                        if r["tournament_id"] not in oly:
+                            out["caps"] += r["appearances"]
+                            out["intl_goals"] += g_
+                            out["intl_assists"] += a_
+            except Exception:
+                pass
+        else:
+            import record_ledger as _RL
+            _RL.wait_idle()
+            cg, ca = _RL.world_values(conn, [player_id]).get(player_id, (0, 0))
+            cg, ca = cg or 0, ca or 0
+            for tid, a_, g_, s_ in conn.execute(
+                    "SELECT tournament_id, appearances, goals, assists FROM intl_squad "
+                    "WHERE player_id=? AND appearances>0 AND tournament_id IN (SELECT id FROM intl_tournaments)",
+                    (player_id,)).fetchall():
+                ig_all += g_ or 0
+                ia_all += s_ or 0
+                if tid not in oly:
+                    out["caps"] += a_ or 0
+                    out["intl_goals"] += g_ or 0
+                    out["intl_assists"] += s_ or 0
+        out["goals"] = cg + ig_all
+        out["assists"] = ca + ia_all
+        return out
+    finally:
+        conn.close()
+
+
+def _league_record_country_id(conn, country):
+    """리그 기록 대상 나라 id — 리그가 있는 나라만, 병역(군대) 리그는 별도 리그라 대상이 아니다. 없으면 None."""
+    try:
+        from military_service import is_military_country
+        if is_military_country(country):
+            return None
+    except Exception:
+        pass
+    r = conn.execute("SELECT cn.id FROM countries cn WHERE cn.name=? AND EXISTS "
+                     "(SELECT 1 FROM leagues l WHERE l.country_id=cn.id)", (country,)).fetchone()
+    return r[0] if r else None
+
+
+def get_league_record_countries():
+    """리그 기록 국가 칸 직접 입력용 — 리그가 있는 나라 이름 전체(병역 리그 나라 제외), 기본 6개국이 맨 앞."""
+    conn = get_conn()
+    try:
+        names = [r[0] for r in conn.execute(
+            "SELECT cn.name FROM countries cn WHERE EXISTS (SELECT 1 FROM leagues l WHERE l.country_id=cn.id) "
+            "ORDER BY cn.name").fetchall()]
+    finally:
+        conn.close()
+    try:
+        from military_service import is_military_country
+        names = [n for n in names if not is_military_country(n)]
+    except Exception:
+        pass
+    head = [n for n in LEAGUE_RECORD_DEFAULT_COUNTRIES if n in names]
+    return head + [n for n in names if n not in head]
+
+
+def get_league_record_tiers(country):
+    """그 나라 리그 부수 목록 [(부수, 리그 이름 묶음)] — 같은 부수에 리그가 여럿이면 이름을 " / "로 묶는다."""
+    conn = get_conn()
+    try:
+        cid = _league_record_country_id(conn, country)
+        if cid is None:
+            return []
+        by = {}
+        for name, tier in conn.execute("SELECT name, tier FROM leagues WHERE country_id=? ORDER BY tier, id",
+                                       (cid,)).fetchall():
+            by.setdefault(tier, []).append(name)
+        return [(t, " / ".join(by[t])) for t in sorted(by)]
+    finally:
+        conn.close()
+
+
+def _my_league_season_rows(conn):
+    """내 선수의 시즌·팀별 리그 기록 [(연도, 팀 id, 골, 도움)] — 시즌을 마친 팀은 my_player_season_stats, 시즌 중에
+    떠난 팀은 커리어 기록(career_entries — 떠나는 순간 그 시즌 그 팀 몫을 닫아 둔다, 시즌 끝 팀 행은 같은 시즌 행이라
+    빼서 두 번 세지 않는다 — game_engine._season_league_splits와 같은 규칙)."""
+    out = []
+    final_team = {}
+    try:
+        for y, t, g, a in conn.execute("SELECT year, team_id, goals, assists FROM my_player_season_stats").fetchall():
+            out.append((y, t, g or 0, a or 0))
+            final_team[y] = t
+    except Exception:
+        return out
+    try:
+        for y, t, g, a in conn.execute(
+                "SELECT end_year, team_id, goals, assists FROM career_entries "
+                "WHERE end_year>0 AND team_id>0 AND COALESCE(matches,0)>0").fetchall():
+            if y in final_team and t != final_team[y]:
+                out.append((y, t, g or 0, a or 0))
+    except Exception:
+        pass
+    return out
+
+
+def _team_year_league_id(conn, team_id, year):
+    """그 팀이 그 해 실제로 경기한 리그 id(보관 순위표 → 경기 결과 → 보관 경기 결과 순) — 내 선수 기록용(몇 줄)."""
+    try:
+        r = conn.execute("SELECT league_id FROM league_season_standings WHERE team_id=? AND year=? LIMIT 1",
+                         (team_id, year)).fetchone()
+        if r and r[0] is not None:
+            return r[0]
+    except Exception:
+        pass
+    for tbl in ("match_results", "match_results_archive"):
+        try:
+            r = conn.execute(f"SELECT league_id FROM {tbl} WHERE year=? AND (home_team_id=? OR away_team_id=?) LIMIT 1",
+                             (year, team_id, team_id)).fetchone()
+        except Exception:
+            r = None
+        if r and r[0] is not None:
+            return r[0]
+    return None
+
+
+def get_league_player_records(country, tier, top_n=RECORD_TOP_N):
+    """그 나라 tier부 리그 통산 최다 득점·도움 — {"goals": [...], "assists": [...]}(_record_rank_lists 형식).
+    기록은 그 시즌에 실제로 뛴 리그에 귀속된다(지금 소속·지금 리그로 다시 나누지 않는다). 시즌 중 이적한 선수는
+    팀별로 나뉜 기록으로 뛴 팀의 리그에 각각 넣는다. 리그 경기만(국내컵·클럽 대항전·국가대표 제외), 시즌이 끝나
+    기록이 확정된 시즌까지. AI 선수는 통산 장부의 리그 범위('나라id:부수')를 바로 읽고, 내 선수는 시즌·팀별 기록
+    (_my_league_season_rows)을 그 팀이 그 해 뛴 리그로 나눠 더한다. 나라가 리그 기록 대상이 아니면(리그 없음·병역
+    리그) 빈 결과."""
+    import record_ledger as _RL
+    conn = get_conn()
+    try:
+        cid = _league_record_country_id(conn, country)
+        if cid is None:
+            return {"goals": [], "assists": []}
+        g, a = _RL.scope_totals(conn, _RL.SCOPE_LEAGUE, f"{cid}:{tier}")
+        lt = {lid: (c_, t_) for lid, c_, t_ in conn.execute("SELECT id, country_id, tier FROM leagues").fetchall()}
+        mg = ma = 0
+        for y, t, gg, aa, _k in _my_club_contribs(conn):   # [2026-11-24] AI 장부와 같은 시점까지
+            if _k == "league" and lt.get(_team_year_league_id(conn, t, y)) == (cid, tier):
+                mg += gg
+                ma += aa
+        if mg:
+            g[MY_PLAYER_ID] = mg
+        if ma:
+            a[MY_PLAYER_ID] = ma
+        return _record_rank_lists(conn, {"goals": g, "assists": a}, top_n)
+    finally:
+        conn.close()
+
+
+# [2026-11-22 신설, 신민용 요청: "역대 개인상 기록에 클럽 대항전 — 챔스·유로파·컨퍼런스, 대륙·대회 필터 두 개,
+# 득점왕·도움왕 1~10위"] 역대 개인상 → 기록 → "클럽 대항전". 대륙 하나 × 대회 하나의 통산 최다 득점·도움.
+CLUB_COMP_RECORD_CONTINENTS = ("유럽", "아시아", "아프리카", "남미", "북미")
+CLUB_COMP_RECORD_KINDS = (("cl", "챔피언스"), ("el", "유로파"), ("ecl", "컨퍼런스"))
+
+
+def get_club_comp_player_records(continent, comp, top_n=RECORD_TOP_N):
+    """continent(대륙) comp('cl' 챔피언스 / 'el' 유로파 / 'ecl' 컨퍼런스) 통산 최다 득점·도움 —
+    {"goals": [...], "assists": [...]}(_record_rank_lists 형식, 1~10위·같은 값은 같은 순위·10위 동점자까지).
+    그 대회 경기만(리그·국내컵·국가대표 제외), 대회가 끝나 시즌 기록이 저장된 해까지. AI 선수는 통산 장부의
+    클럽 대항전 범위('대륙:대회' — 대회를 뛴 팀 기준, 시즌 중 이적생은 이적 전 팀), 내 선수는 경기 실측
+    (my_played 경기의 골·도움, AI 대회 기록이 저장된 해까지)."""
+    import record_ledger as _RL
+    conn = get_conn()
+    try:
+        g, a = _RL.scope_totals(conn, _RL.SCOPE_CC, f"{continent}:{comp}")
+        if comp in _RL.CC_KINDS:
+            try:
+                _r = conn.execute("SELECT current_year FROM season_state WHERE id=1").fetchone()
+                cy = _r[0] if _r and _r[0] is not None else 10 ** 9
+                mg = ma = 0
+                for y, gg, aa in conn.execute(
+                        f"SELECT t.year, COALESCE(SUM(m.my_goals),0), COALESCE(SUM(m.my_assists),0) "
+                        f"FROM {comp}_matches m JOIN {comp}_tournaments t ON m.tournament_id = t.id "
+                        f"WHERE m.my_played = 1 AND t.continent = ? GROUP BY t.year", (continent,)).fetchall():
+                    if y < cy or _record_part_applied(conn, y, "comp:cl"):
+                        mg += gg
+                        ma += aa
+                if mg:
+                    g[MY_PLAYER_ID] = mg
+                if ma:
+                    a[MY_PLAYER_ID] = ma
+            except Exception:
+                pass
+        return _record_rank_lists(conn, {"goals": g, "assists": a}, top_n)
+    finally:
+        conn.close()
+
+
+# [2026-11-22 신설, 신민용 요청: "팀 검색 → ㅁㅁ 역대 기록 줄 오른쪽 '클럽 기록' — 그 클럽 최다 득점·도움 1~10위,
+# 구단 올해의 선수 2회 이상"] 득점·도움 = 그 팀에서 뛴 모든 클럽 공식전(리그·국내컵·클럽 대항전·슈퍼컵·
+# 클럽월드컵·하위컵·국내슈퍼컵), 국가대표 제외.
+CLUB_POTY_MIN_WINS = 2
+
+
+def _my_club_team_totals(conn, team_id):
+    """내 선수가 그 팀에서 쌓은 클럽 통산 (골, 도움) — 리그(시즌·팀별) + 클럽 대회(경기 실측, 팀이 안 적힌 옛
+    경기는 그 해 시즌을 마친 팀 몫 — get_my_club_comp_stats 규칙), 대회는 시즌이 끝난 해까지(세계 통산과 같다)."""
+    g = a = 0
+    for _y, t, gg, aa, _k in _my_club_contribs(conn):   # [2026-11-24] AI 장부와 같은 시점까지
+        if t == team_id:
+            g += gg
+            a += aa
+    return g, a
+
+
+def get_club_player_records(team_id, top_n=RECORD_TOP_N):
+    """그 클럽 통산 최다 득점·도움 — {"goals": [...], "assists": [...]}(_record_rank_lists 형식). AI 선수는 통산
+    장부의 클럽 범위(시즌 중 이적생은 리그는 팀별 조각, 상반기 대회(클럽 대항전·국내슈퍼컵)는 이적 전 팀),
+    내 선수는 _my_club_team_totals."""
+    import record_ledger as _RL
+    conn = get_conn()
+    try:
+        g, a = _RL.scope_totals(conn, _RL.SCOPE_CLUB, str(int(team_id)))
+        mg, ma = _my_club_team_totals(conn, int(team_id))
+        if mg:
+            g[MY_PLAYER_ID] = mg
+        if ma:
+            a[MY_PLAYER_ID] = ma
+        out = _record_rank_lists(conn, {"goals": g, "assists": a}, top_n)
+        _attach_club_periods(conn, team_id, out)   # [2026-11-23] 선수 줄 아래 이 클럽 소속 기간
+        return out
+    finally:
+        conn.close()
+
+
+def _club_season_values(conn, team_id, pids):
+    """[2026-11-24] {(선수, 연도): [골, 도움]} — AI 선수 pids가 그 클럽에서 쌓은 시즌별 기록(모든 클럽 공식전).
+    통산 장부 클럽 범위('C')와 같은 귀속 규칙(record_ledger.compute_from_hist):
+      · 리그: 그 해 반기 조각(hist.ai_player_season_team_stats)이 있는 선수는 조각의 팀, 없으면 시즌을 마친 팀.
+      · 대회: 상반기 대회(클럽 대항전·국내슈퍼컵 — record_ledger.FIRST_HALF_COMPS)는 이적 전 팀(반기 1 조각),
+        나머지 대회는 시즌을 마친 팀.
+    그래서 선수별로 연도를 다 더하면 장부의 그 클럽 통산과 같다. 선수 id로만 찾는다(기본 키 앞부분)."""
+    import record_ledger as _RL
+    team_id = int(team_id)
+    fh = set(_RL.FIRST_HALF_COMPS)
+    out = {}
+    ai = sorted({int(p) for p in pids if p is not None and p != MY_PLAYER_ID})
+    for k in range(0, len(ai), 500):
+        part = ai[k:k + 500]
+        ph = ",".join("?" * len(part))
+        final, half1, pieced = {}, {}, set()
+        for pid, y, t, g, a in conn.execute(
+                f"SELECT player_id, year, team_id, COALESCE(goals,0), COALESCE(assists,0) "
+                f"FROM hist.ai_player_season_stats WHERE player_id IN ({ph})", part).fetchall():
+            final[(pid, y)] = (t, g, a)
+        for pid, y, t, hf, g, a in conn.execute(
+                f"SELECT player_id, year, team_id, half, COALESCE(goals,0), COALESCE(assists,0) "
+                f"FROM hist.ai_player_season_team_stats WHERE player_id IN ({ph})", part).fetchall():
+            pieced.add((pid, y))
+            if hf == 1:
+                half1[(pid, y)] = t
+            if t == team_id:
+                v = out.setdefault((pid, y), [0, 0])
+                v[0] += g
+                v[1] += a
+        for key, (t, g, a) in final.items():
+            if key not in pieced and t == team_id:
+                v = out.setdefault(key, [0, 0])
+                v[0] += g
+                v[1] += a
+        for pid, y, comp, g, a in conn.execute(
+                f"SELECT player_id, year, competition, COALESCE(goals,0), COALESCE(assists,0) "
+                f"FROM hist.ai_player_season_stats_by_comp WHERE player_id IN ({ph})", part).fetchall():
+            if not g and not a:
+                continue
+            ft = final.get((pid, y), (None, 0, 0))[0]
+            t = half1.get((pid, y), ft) if comp in fh else ft
+            if t == team_id:
+                v = out.setdefault((pid, y), [0, 0])
+                v[0] += g
+                v[1] += a
+    return out
+
+
+def get_club_season_records(team_id, top_n=RECORD_TOP_N):
+    """[2026-11-24 신설, 신민용 요청] 구단 기록 → 단일 시즌 최다 득점·도움 — {"season_goals": [...], "season_assists": [...]}
+    (_record_rank_lists 행 + "year"). 한 줄 = 선수 한 명의 그 클럽 한 시즌(같은 선수가 여러 번 나올 수 있다).
+    값 = 그 시즌 그 클럽 소속으로 뛴 모든 클럽 공식전(리그·국내컵·클럽 대항전·슈퍼컵·클럽월드컵·하위컵·국내슈퍼컵),
+    국가대표 제외. 시즌 중 이적하면 그 클럽에서 뛴 몫만(_club_season_values — 구단 최다 득점·도움과 같은 귀속 규칙).
+    시즌이 끝난 기록까지. 후보 = 그 클럽 통산 장부에 골·도움이 있는 선수(그 클럽에서 한 골·도움이라도 있어야 값이
+    생긴다) — 시즌 기록 표는 팀으로 찾을 색인이 없어 그 선수들만 선수 id로 찾는다. 내 선수는 _my_club_contribs.
+    1~top_n위(Dense 표시, top_n 자리 동점까지), 같은 기록은 이른 시즌이 위."""
+    import record_ledger as _RL
+    conn = get_conn()
+    try:
+        tid = int(team_id)
+        g, a = _RL.scope_totals(conn, _RL.SCOPE_CLUB, str(tid))
+        vals = _club_season_values(conn, tid, set(g) | set(a))
+        for y, t, gg, aa, _k in _my_club_contribs(conn):
+            if t == tid and (gg or aa):
+                v = vals.setdefault((MY_PLAYER_ID, y), [0, 0])
+                v[0] += gg
+                v[1] += aa
+        picks = {}
+        for key, ci in (("season_goals", 0), ("season_assists", 1)):
+            ent = sorted(((pid, y, v[ci]) for (pid, y), v in vals.items() if v[ci] > 0),
+                         key=lambda e: (-e[2], e[1], e[0]))
+            ranks, n = _dense_rank_cut([e[2] for e in ent], top_n)
+            picks[key] = [(r_, pid, v, {"year": y}) for r_, (pid, y, v) in zip(ranks, ent[:n])]
+        return _record_rows_from_picks(conn, picks)
+    finally:
+        conn.close()
+
+
+def get_club_poty_multi_winners(team_id, min_wins=CLUB_POTY_MIN_WINS, top_n=None):
+    """그 클럽 "구단 올해의 선수"를 min_wins회 이상 받은 선수 — 많이 받은 순(같은 횟수는 공동 순위, 그 횟수에 먼저
+    도달한 선수가 위 — get_award_multi_winners와 같은 규칙, [2026-11-23] 표시는 Dense, 줄은 예전처럼 전원(top_n None)). 구단 올해의 선수는 리그 개인상으로 저장된다
+    (category='league', 그 해 그 리그 나라·부수, team_id = 그 팀). 팀이 해마다 뛴 리그(보관 순위표, 팀 색인)로
+    그 해 그 리그 개인상만 색인으로 찾는다 — 개인상 표 전체를 훑지 않는다.
+    반환 [{rank, player_id, name, wins, years, nationality, nat_flag, position, team_name, retired}]."""
+    from constants import ai_player_code
+    conn = get_conn()
+    try:
+        team_id = int(team_id)
+        lg = {lid: (cn, t_) for lid, cn, t_ in conn.execute(
+            "SELECT l.id, cn.name, l.tier FROM leagues l JOIN countries cn ON cn.id = l.country_id").fetchall()}
+        seasons = {}
+        try:
+            for y, lid in conn.execute("SELECT year, league_id FROM league_season_standings WHERE team_id=?",
+                                       (team_id,)).fetchall():
+                seasons.setdefault(y, lid)
+        except Exception:
+            pass
+        years_by = {}
+        for y in sorted(seasons):
+            key = lg.get(seasons[y])
+            if key is None:
+                continue
+            for (pid,) in conn.execute(
+                    """SELECT DISTINCT player_id FROM hist.season_individual_awards
+                       WHERE category='league' AND year=? AND league_country=? AND league_tier=?
+                         AND award_kind='구단 올해의 선수' AND team_id=? AND player_id IS NOT NULL""",
+                    (y, key[0], key[1], team_id)).fetchall():
+                years_by.setdefault(pid, []).append(y)
+        out = _multi_winner_rows(conn, years_by, min_wins, top_n)
+        _attach_club_periods(conn, team_id, {0: out})   # [2026-11-23] 선수 줄 아래 이 클럽 소속 기간(득점·도움 표와 같은 규칙)
+        return out
+    finally:
+        conn.close()
+
+
+
 # [2026-09 신설, 신민용 요청: "선수 검색에서 연도를 눌렀을 때 그 아래에
 # 한 줄을 더 만들고 거기에 받은 상들을 적는거 어때?"] 선수 검색 탭의
 # "연도별 기록"에서 연도를 펼치면(ui.world_browser_window._on_player_
@@ -8755,6 +9819,9 @@ def clear_team_history_cache():
     """새 게임/DB 초기화 시 database.py가 호출 — 위 캐시 주석 참고."""
     _TEAM_YEAR_ENTRY_CACHE.clear()
     _PO_SIDE_CACHE.clear()
+    # [2026-11-22] A매치 기록 캐시도 비운다 — 기록 시점 키(_record_stamp)가 연도·건수라 새 판이 우연히 같은 값이면
+    # 이전 판 순위가 보일 수 있다.
+    _AMATCH_PAST_CACHE.clear()
 
 
 # [2026-10 18번, 신민용 요청: "승격 플레이오프에 들어갔던 팀은 [승격 플레이오프 탈락](귤색),
@@ -9486,6 +10553,39 @@ def get_team_countries(team_ids=(), team_names=()):
     finally:
         conn.close()
     return by_id, by_name
+
+
+def get_club_comp_continents(keys):
+    """[2026-11-23 신설, 신민용 요청: 선수 "기록 복사" 맨 위 우승 기록을 대회 이름별로 — "콩카카프 그랜드 슈퍼컵 (북미)"]
+    keys = [(kind, 대회 이름, 연도)] — kind 'champions'/'europa'/'conference'(클럽 대항전) 또는 'sc'(대륙 슈퍼컵).
+    반환 {key: 대륙} — 그 해 그 이름 대회 표의 대륙 칸(같은 해 같은 이름이 둘 이상이면 넣지 않는다). 읽기 전용, 몇 줄."""
+    tbl = {"champions": "cl_tournaments", "europa": "el_tournaments", "conference": "ecl_tournaments",
+           "sc": "sc_tournaments"}
+    out = {}
+    keys = {k for k in keys if k and k[0] in tbl and k[1]}
+    if not keys:
+        return out
+    conn = get_conn()
+    try:
+        for kind, t in tbl.items():
+            want = sorted({(n, y) for kk, n, y in keys if kk == kind})
+            for i in range(0, len(want), 400):
+                part = want[i:i + 400]
+                found = {}
+                try:
+                    for n, y, cont in conn.execute(
+                            f"SELECT name, year, continent FROM {t} WHERE " +
+                            " OR ".join("(name=? AND year=?)" for _ in part),
+                            [v for nm_y in part for v in nm_y]).fetchall():
+                        found.setdefault((n, y), set()).add(cont)
+                except Exception:
+                    continue
+                for (n, y), conts in found.items():
+                    if len(conts) == 1:
+                        out[(kind, n, y)] = next(iter(conts))
+    finally:
+        conn.close()
+    return out
 
 
 def _team_country_name(conn, team_id):
@@ -10621,9 +11721,16 @@ def get_world_population_stats(conn=None):
                                 OR EXISTS (SELECT 1 FROM ai_players a WHERE a.id = m.from_player_id))""")
         except Exception:
             pass        # 감독 표가 없는 구세이브
+        # [2026-11-22 1단계] 가상 유스는 세계 총수(현역)에 포함, 따로도 센다(1군·리그 등록 수에는 원래 안 들어감)
+        try:
+            import virtual_youth as _vy
+            _vv = sorted(_vy.vids(conn))
+            p_virtual = q(f"SELECT COUNT(*) FROM ai_players WHERE team_id IN ({','.join(str(int(x)) for x in _vv)})") if _vv else 0
+        except Exception:
+            p_virtual = 0
         return {
             "players_total": p_active + p_retired, "players_active": p_active,
-            "players_retired": p_retired,
+            "players_retired": p_retired, "players_virtual_youth": p_virtual,
             "managers_total": m_total, "managers_active": m_active,
             "managers_free": m_free, "managers_retired": m_retired,
             "player_managers": overlap,

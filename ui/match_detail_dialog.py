@@ -157,6 +157,35 @@ def _stat_compare_row(label, home_val, away_val):
     return w
 
 
+_COUNTRY_NAMES = None
+
+
+def _plain_team_name(name):
+    """[2026-11-21 신설, 신민용 요청: "경기 통계 맨 위 팀 이름 — 챔스 등은 팀명 뒤 (국가)가 붙는데 없애줘"]
+    대륙 대항전 저장 이름 "🇪🇸레알 마드리드(스페인)"에서 국기와 끝의 "(국가)"를 뗀다. 괄호 안이 실제 국가명일 때만
+    떼므로 "마스트리흐트(MVV)"·"FC 이마바리(2군)"처럼 팀명 자체에 붙은 괄호는 그대로 둔다. 저장 데이터는 바꾸지 않는다."""
+    global _COUNTRY_NAMES
+    # 국기 = 지역 표시 문자 2개(🇪🇸) 또는 잉글랜드·스코틀랜드처럼 🏴 + 태그 문자
+    n = "".join(ch for ch in (name or "")
+                if not (0x1F1E6 <= ord(ch) <= 0x1F1FF or ord(ch) == 0x1F3F4 or 0xE0020 <= ord(ch) <= 0xE007F)).strip()
+    if n.endswith(")") and "(" in n:
+        i = n.rfind("(")
+        inner = n[i + 1:-1].strip()
+        if _COUNTRY_NAMES is None:
+            try:
+                from database import get_conn
+                _c = get_conn()
+                try:
+                    _COUNTRY_NAMES = {r[0] for r in _c.execute("SELECT name FROM countries").fetchall()}
+                finally:
+                    _c.close()
+            except Exception:
+                _COUNTRY_NAMES = set()
+        if inner in _COUNTRY_NAMES or inner == "?":
+            n = n[:i].rstrip()
+    return n or (name or "")
+
+
 class MatchStatsPanel(QWidget):
     """경기 통계 인라인 패널. team_stats가 없는(예전 저장분) 경기는 안내
     문구만 보여준다 — 억지로 랜덤 값을 만들어 채우지 않는다."""
@@ -175,13 +204,16 @@ class MatchStatsPanel(QWidget):
         hdr.setStyleSheet("color:#fff;font-size:14px;font-weight:bold;")
         root.addWidget(hdr)
 
-        names = QWidget(); nh = QHBoxLayout(names); nh.setContentsMargins(0, 0, 0, 0)
-        hn = QLabel(data.get("home_name", "홈팀"))
+        # [2026-11-21 신민용 요청] 팀 이름은 한 줄 좌우 대신 두 줄(위 홈 파랑 / 아래 원정 빨강) — 통계 행의 왼쪽(파랑)·
+        # 오른쪽(빨강) 값과 색으로 짝을 맞춘다. 대륙 대항전 저장 이름의 국기·(국가)는 뗀다(_plain_team_name).
+        names = QWidget(); nv = QVBoxLayout(names); nv.setContentsMargins(0, 0, 0, 0); nv.setSpacing(2)
+        hn = QLabel(_plain_team_name(data.get("home_name", "홈팀")))
         hn.setStyleSheet(f"color:{_HOME_COLOR};font-size:12px;font-weight:bold;")
-        an = QLabel(data.get("away_name", "원정팀"))
+        hn.setWordWrap(True)
+        an = QLabel(_plain_team_name(data.get("away_name", "원정팀")))
         an.setStyleSheet(f"color:{_AWAY_COLOR};font-size:12px;font-weight:bold;")
-        an.setAlignment(Qt.AlignmentFlag.AlignRight)
-        nh.addWidget(hn); nh.addStretch(); nh.addWidget(an)
+        an.setWordWrap(True)
+        nv.addWidget(hn); nv.addWidget(an)
         root.addWidget(names)
 
         if not team_stats:
@@ -1097,7 +1129,8 @@ class MatchDetailDialog(QDialog):
             payload.get("team_stats") or payload.get("player_ratings") or events)
 
         is_home = bool(data.get("is_home"))
-        loc = "홈" if is_home else "원정"
+        # [2026-11] 중립 경기(payload["neutral"])는 홈/원정 대신 "중립"
+        loc = "중립" if payload.get("neutral") else ("홈" if is_home else "원정")
         rs  = {"win": "승", "draw": "무", "loss": "패"}.get(data.get("result", ""), "")
         rs_color = {"승": "#4488ff", "무": "#888888", "패": "#ff4444"}.get(rs, "#ccc")
 

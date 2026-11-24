@@ -2360,9 +2360,10 @@ def simulate_my_match(home_team_id, away_team_id, home_formation, away_formation
         else:
             away_lineup, away_bench, _ = _insert_me(away_lineup, away_bench, _slots, me["player"],
                                                     me.get("field_pos"), me["status"])
-        if me.get("yellow_add") or me.get("red_add"):
+        if me.get("yellow_add") or me.get("red_add") or me.get("no_cards"):   # [2026-11-21] no_cards = 페어플레이어
             pmods = {MY_SIM_PLAYER_ID: {"yellow_add": me.get("yellow_add", 0.0),
-                                        "red_add": me.get("red_add", 0.0)}}
+                                        "red_add": me.get("red_add", 0.0),
+                                        "no_cards": bool(me.get("no_cards"))}}
     _hs, _as = hp["style"], ap["style"]
     _hsa = club_match_strength_extra(home_team_id, strength_rule)
     _asa = club_match_strength_extra(away_team_id, strength_rule)
@@ -2432,9 +2433,10 @@ def simulate_my_intl_match(home_lineup, away_lineup, home_formation, away_format
         else:
             away_lineup, away_bench, _ = _insert_me(away_lineup, away_bench, _slots, me["player"],
                                                     me.get("field_pos"), me["status"])
-        if me.get("yellow_add") or me.get("red_add"):
+        if me.get("yellow_add") or me.get("red_add") or me.get("no_cards"):   # [2026-11-21] no_cards = 페어플레이어
             pmods = {MY_SIM_PLAYER_ID: {"yellow_add": me.get("yellow_add", 0.0),
-                                        "red_add": me.get("red_add", 0.0)}}
+                                        "red_add": me.get("red_add", 0.0),
+                                        "no_cards": bool(me.get("no_cards"))}}
     sim = simulate_chain_match(home_lineup, away_lineup, home_adv=0.0, seed=seed,
                                home_formation=home_formation, away_formation=away_formation,
                                home_bench=home_bench, away_bench=away_bench,

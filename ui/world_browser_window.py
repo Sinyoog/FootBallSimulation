@@ -85,6 +85,83 @@ import pitch_names as _pn   # [2026-10] 피치 이름 축약 표기(T. 몬테이
 # 저장하기 위한 전용 데이터 롤. 기존에 이미 UserRole(연도/시즌, team_id 등)을
 # 여러 곳에서 쓰고 있어서 충돌을 피하려고 +50 오프셋을 둔다.
 _CLEAN_TEXT_ROLE = Qt.ItemDataRole.UserRole + 50
+# [2026-11-23 신설] 수상 연도 칸 원본(연도 목록) — 칸 너비가 바뀌면 이걸로 줄바꿈을 다시 한다(_apply_years_wrap).
+_YEARS_ROLE = Qt.ItemDataRole.UserRole + 53
+
+
+# [2026-11-23 신설, 신민용 요청: 수상 연도 "1줄에 4개씩"] 다회 수상 표의 칸 너비 규칙 — 칸은 모두 내용 맞춤이고
+# 어떤 칸도 내용보다 좁아지지 않는다(연도 4개 한 줄·이름이 다시 접히거나 잘리지 않게). 표 폭이 남을 때만 마지막 칸이
+# 남는 폭을 받고, 모자라면 가로 스크롤. min_to_content=True면 표 최소 폭을 내용 폭으로 잡는다(클럽 기록 창).
+def _table_content_width(tbl):
+    hdr = tbl.horizontalHeader()
+    return sum(max(tbl.sizeHintForColumn(c), hdr.sectionSizeHint(c)) for c in range(tbl.columnCount()))
+
+
+def _fit_columns_now(tbl):
+    try:
+        need = _table_content_width(tbl)
+        if getattr(tbl, "_fit_min_to_content", False):
+            tbl.setMinimumWidth(need + 2 * tbl.frameWidth() + tbl.verticalScrollBar().sizeHint().width() + 2)
+        room = tbl.viewport().width() >= need
+        hdr = tbl.horizontalHeader()
+        if hdr.stretchLastSection() != room:
+            hdr.setStretchLastSection(room)
+    except RuntimeError:
+        pass   # 표가 이미 닫힘
+
+
+class _FitColumnsFilter(QObject):
+    """표 크기가 바뀌거나 처음 보일 때 _fit_columns_now를 다음 이벤트 차례에 부른다."""
+    def eventFilter(self, obj, ev):
+        if ev.type() in (QEvent.Type.Resize, QEvent.Type.Show):
+            tbl = obj
+            QTimer.singleShot(0, lambda t=tbl: _fit_columns_now(t))
+        return False
+
+
+class _RowRefreshFilter(QObject):
+    """[2026-11-24 신설, 신민용 리포트: "구단 올해의 선수 수상 연도가 '1988, 1989, 1990, 1991…'로 잘린다"] 표를 채우는
+    시점에 잰 줄 높이·칸 폭은 창이 처음 뜰 때(스타일·글꼴이 실제로 입혀질 때) 글자가 커지면 모자라진다 — 테스트 환경
+    (기본 글꼴)에서는 맞았지만 실제 화면에서는 두 줄짜리 수상 연도가 한 줄 높이에 갇혀 말줄임표로 잘렸다. 표가 보일 때·
+    글꼴/스타일이 바뀔 때 다음 이벤트 차례에 내용 맞춤 칸 폭과 줄 높이를 다시 잰다(두 줄 묶음 표의 기간 줄은 한 줄 높이)."""
+    def eventFilter(self, obj, ev):
+        if ev.type() in (QEvent.Type.Show, QEvent.Type.FontChange, QEvent.Type.StyleChange, QEvent.Type.Polish):
+            if not getattr(obj, "_row_refresh_pending", False):
+                obj._row_refresh_pending = True
+                QTimer.singleShot(0, lambda t=obj: _refresh_table_rows(t))
+        return False
+
+
+def _refresh_table_rows(tbl):
+    try:
+        tbl._row_refresh_pending = False
+        hdr = tbl.horizontalHeader()
+        for c in range(tbl.columnCount()):
+            if hdr.sectionResizeMode(c) == QHeaderView.ResizeMode.ResizeToContents:
+                tbl.resizeColumnToContents(c)
+        tbl.resizeRowsToContents()
+        if getattr(tbl, "_paired_rows", False):
+            h = tbl.fontMetrics().height() + 5
+            for r in range(1, tbl.rowCount(), 2):
+                tbl.setRowHeight(r, h)
+        _fit_columns_now(tbl)
+    except RuntimeError:
+        pass   # 표가 이미 닫힘
+
+
+def _install_row_refresh(tbl):
+    if not getattr(tbl, "_row_refresh_filter", None):
+        tbl._row_refresh_filter = _RowRefreshFilter(tbl)
+        tbl.installEventFilter(tbl._row_refresh_filter)
+
+
+def _install_fit_columns(tbl, min_to_content=False):
+    if min_to_content:
+        tbl._fit_min_to_content = True
+    if not getattr(tbl, "_fit_filter", None):
+        tbl._fit_filter = _FitColumnsFilter(tbl)
+        tbl.installEventFilter(tbl._fit_filter)
+    _fit_columns_now(tbl)
 # [2026-09 신설, 신민용 리포트 1번: "팀 검색에서 선수 변경하면 우측에 구단
 # 사용 금액에 표시된 선수도 바로 변경되어야 하는데 이것도 안 되어 있고"]
 # 재정 패널(_build_team_finance_panel)의 "선수 이름" 행에 그 선수 id를
@@ -777,6 +854,75 @@ def _awards_from_year_rows(rows):
         if e.get("dsc") and "[우승]" in e["dsc"]:
             a["dsc_champions"] += 1
     return a
+
+
+_LEAGUE_NAME_TIER_RE = _re_rank.compile(r"^(.*?)\((\d+)부\)\s*\[")
+
+
+def _comp_name_of(text):
+    """'코파 MX [우승]' → '코파 MX' (대회 성적 글자에서 대회 이름만)."""
+    return (text or "").rsplit(" [", 1)[0].strip()
+
+
+def _title_lines_from_year_rows(rows):
+    """[2026-11-23 신설, 신민용 요청] 선수 "기록 복사" 맨 위 우승 기록 — 대회 이름별 줄
+    ("리가 MX (멕시코 1부) 우승 1회"). 판정은 통산 수상 집계와 같다(_awards_from_year_rows·
+    world_browser 선수 경력 집계: 리그 [1등], 나머지 [우승], 3·4부 컵은 국내컵 다음) — 단 리그는 반기(상반기)
+    줄을 세지 않는다(그 줄의 순위는 반기 순위표라 우승이 아니다 — 백엔드도 반기 분리 전 줄로 센다).
+    순서: 리그 → 국내컵(3·4부 컵 포함) → 클럽 대항전(챔스·유로파·컨퍼런스) → 슈퍼컵 → 클럽 월드컵 → 국내 슈퍼컵.
+    같은 묶음 안에서는 많이 우승한 대회부터, 같으면 먼저 우승한 대회부터.
+    나라 = 그 해 그 줄 소속팀의 나라(row["team_country"]), 대륙 = 그 해 그 대회 표의 대륙(못 찾으면 괄호 없이)."""
+    _CL_ORDER = {"champions": 0, "europa": 1, "conference": 2}
+    found = {}   # (묶음, 하위 순서, 표시 이름) → [횟수, 처음 우승 연도]
+
+    def _add(group, sub, label, year):
+        k = (group, sub, label)
+        if k not in found:
+            found[k] = [0, year if year is not None else 10 ** 9]
+        found[k][0] += 1
+        if year is not None and year < found[k][1]:
+            found[k][1] = year
+
+    pending = []   # 대륙을 나중에 붙일 것 [(묶음, 하위 순서, kind, 이름, 연도)]
+    for r in rows or []:
+        e = r.get("entry") or {}
+        if r.get("is_retired_row") or not e:
+            continue
+        y = r.get("year")
+        nat = (r.get("team_country") or "").strip()
+        if e.get("league") and not e.get("_is_half") and _RANK1_RE.search(e["league"]):
+            lname, tier = e.get("league_name"), e.get("league_tier")
+            if not lname or tier is None:
+                m = _LEAGUE_NAME_TIER_RE.match(e["league"])
+                lname, tier = (m.group(1).strip(), int(m.group(2))) if m else (_comp_name_of(e["league"]), None)
+            where = " ".join(x for x in (nat, f"{tier}부" if tier is not None else "") if x)
+            _add(0, 0, f"{lname} ({where})" if where else lname, y)
+        if e.get("cup") and "[우승]" in e["cup"]:
+            n = _comp_name_of(e["cup"])
+            _add(1, 0, f"{n} ({nat})" if nat else n, y)
+        if e.get("cl") and "[우승]" in e["cl"]:
+            n = _comp_name_of(e["cl"])
+            if e.get("cl_kind") == "lower_cup":
+                _add(1, 1, f"{n} ({nat})" if nat else n, y)
+            else:
+                pending.append((2, _CL_ORDER.get(e.get("cl_kind"), 3), e.get("cl_kind"), n, y))
+        if e.get("sc") and "[우승]" in e["sc"]:
+            pending.append((3, 0, "sc", _comp_name_of(e["sc"]), y))
+        if e.get("cwc") and "[우승]" in e["cwc"]:
+            _add(4, 0, _comp_name_of(e["cwc"]), y)
+        if e.get("dsc") and "[우승]" in e["dsc"]:
+            n = _comp_name_of(e["dsc"])
+            _add(5, 0, f"{n} ({nat})" if nat else n, y)
+    if pending:
+        try:
+            conts = wb.get_club_comp_continents([(k, n, y) for _g, _s, k, n, y in pending])
+        except Exception:
+            conts = {}
+        for g, s, k, n, y in pending:
+            c = conts.get((k, n, y))
+            _add(g, s, f"{n} ({c})" if c else n, y)
+    items = sorted(found.items(), key=lambda kv: (kv[0][0], kv[0][1], -kv[1][0], kv[1][1], kv[0][2]))
+    return [f"{label} 우승 {cnt}회" for (_g, _s, label), (cnt, _fy) in items]
 
 
 def _apply_cutoff_year(rows, intl_records, cutoff_year):
@@ -1504,6 +1650,16 @@ def _attach_label_copy(label, clean_text):
         menu.exec(label.mapToGlobal(pos))
 
     label.customContextMenuRequested.connect(_show_menu)
+
+
+class _FirstPaintProbe(QObject):
+    """[2026-11-23 진단 전용] 기록실 창의 첫 그리기 이벤트 시각만 기록한다(_perf_report_open이 쓰고 떼어 낸다)."""
+
+    def eventFilter(self, obj, ev):
+        if ev.type() == QEvent.Type.Paint and getattr(obj, "_perf_first_paint", 1) is None:
+            import time as _t
+            obj._perf_first_paint = _t.perf_counter()
+        return False
 
 
 def _clamp_and_resize(widget, w, h):
@@ -3136,6 +3292,13 @@ class WorldBrowserWindow(QDialog):
         으로(메인 메뉴, 팀 검색 화면 등에서) 연 창은 둘 다 None이라
         keyPressEvent가 그냥 평범한 다이얼로그 기본 동작으로 남는다."""
         super().__init__(parent)
+        # [2026-11-23 진단 전용, 신민용 리포트: "기록실을 열 때마다 버퍼링"] 생성자 전체·인구 집계·첫 표시(최대화 후
+        # 배치·그리기)까지 시간을 [PERF-WORLD] 한 줄로 찍는다(_perf_report_open). 동작은 바꾸지 않는다.
+        import time as _time_open
+        self._perf_open_t0 = _time_open.perf_counter()
+        self._perf_open = {}
+        self._perf_paint_probe = None
+        self._perf_first_paint = None
         self._fm_nav = nav
         self._fm_panel = panel
         self._fm_player_id = None
@@ -3223,7 +3386,9 @@ class WorldBrowserWindow(QDialog):
         hdr_row.addWidget(self._population_lbl)
         hdr_row.addStretch(1)
         _OPEN_WORLD_BROWSERS.add(self)
+        _tp0 = _time_open.perf_counter()
         self._refresh_population_stats()
+        self._perf_open["인구 집계"] = _time_open.perf_counter() - _tp0
         _click_lbl = QLabel("선수 클릭")
         _click_lbl.setStyleSheet("color:#888;font-size:11px;")
         hdr_row.addWidget(_click_lbl)
@@ -3343,6 +3508,7 @@ class WorldBrowserWindow(QDialog):
         _wb_marks.append(("(나머지 12개 지연 배치)", _time_wb.perf_counter()))
 
         _wb_total = _wb_marks[-1][1] - _wb_t0
+        self._perf_open["탭"] = _wb_total
         if _wb_total >= 0.05:
             _prev = _wb_t0
             _parts = []
@@ -3359,6 +3525,7 @@ class WorldBrowserWindow(QDialog):
 
         if open_player_id is not None:
             self.open_to_player(open_player_id)
+        self._perf_open["생성자"] = _time_open.perf_counter() - self._perf_open_t0
 
     def _on_player_note_link(self, _href):
         mid = getattr(self, "_player_note_mgr_id", None)
@@ -3890,8 +4057,37 @@ class WorldBrowserWindow(QDialog):
             # 최대화된 창을 제목줄로 끌면 Windows가 최대화를 풀고 "최대화 전 크기"(생성자에서
             # 잡은 화면의 92%×88%)로 돌아간다. 최대화하기 전에 그 크기를 작업 영역 전체(창
             # 테두리·제목줄 포함)로 맞춰 두면, 끌어도 크기는 그대로고 위치만 움직인다.
+            import time as _time_show
+            self._perf_open["생성 끝→표시 시작"] = _time_show.perf_counter() - self._perf_open_t0 - self._perf_open.get("생성자", 0)
+            self._perf_show_t0 = _time_show.perf_counter()
+            self._perf_first_paint = None
+            if self._perf_paint_probe is None:
+                self._perf_paint_probe = _FirstPaintProbe(self)
+                self.installEventFilter(self._perf_paint_probe)
             self._set_normal_geometry_to_work_area()
             self.showMaximized()
+            self._perf_open["최대화 처리"] = _time_show.perf_counter() - self._perf_show_t0
+            # 이벤트 루프를 두 번 돈 뒤(배치·그리기 이벤트까지 처리된 근사 시점)에 한 줄로 찍는다
+            QTimer.singleShot(0, lambda: QTimer.singleShot(0, self._perf_report_open))
+
+    def _perf_report_open(self):
+        """[2026-11-23 진단 전용] 기록실 열기 시간 한 줄 — 생성자(그 안의 인구 집계·탭) / 첫 표시까지."""
+        try:
+            import time as _t
+            p = self._perf_open
+            show = _t.perf_counter() - getattr(self, "_perf_show_t0", _t.perf_counter())
+            total = _t.perf_counter() - self._perf_open_t0
+            ctor = p.get("생성자", 0)
+            print(f"[PERF-WORLD] 기록실 열기 총 {total:.3f}s — 생성자 {ctor:.3f}s(인구 집계 {p.get('인구 집계', 0):.3f}s · "
+                  f"탭 {p.get('탭', 0):.3f}s · 그 외 {ctor - p.get('인구 집계', 0) - p.get('탭', 0):.3f}s) | "
+                  f"생성 끝→표시 시작 {p.get('생성 끝→표시 시작', 0):.3f}s | 첫 표시(최대화·배치·그리기) {show:.3f}s"
+                  f"(최대화 처리 {p.get('최대화 처리', 0):.3f}s · 첫 그리기 시작까지 "
+                  f"{(self._perf_first_paint - self._perf_show_t0) if self._perf_first_paint else -1:.3f}s)")
+            if self._perf_paint_probe is not None:
+                self.removeEventFilter(self._perf_paint_probe)
+                self._perf_paint_probe = None
+        except RuntimeError:
+            pass
 
     def _set_normal_geometry_to_work_area(self):
         screen = self.screen() or QGuiApplication.primaryScreen()
@@ -5429,7 +5625,18 @@ class WorldBrowserWindow(QDialog):
         title_row = QHBoxLayout()
         self.team_detail_title = QLabel("← 왼쪽에서 팀을 선택하세요")
         self.team_detail_title.setStyleSheet("color:#00cc44;font-size:14px;font-weight:bold;")
-        title_row.addWidget(self.team_detail_title, 1)
+        title_row.addWidget(self.team_detail_title)
+        # [2026-11-22 신설, 신민용 요청] "ㅁㅁ 역대 기록" 글자 바로 오른쪽 "클럽 기록" — 그 클럽 최다 득점·도움 1~10위,
+        # 구단 올해의 선수 2회 이상(_open_club_records_dialog).
+        # [2026-11-24 변경, 신민용 요청] 버튼 이름 "클럽 기록" → "구단 기록"(창 제목도 같이).
+        self.team_records_btn = QPushButton("구단 기록")
+        self.team_records_btn.setEnabled(False)
+        self.team_records_btn.setAutoDefault(False)
+        self.team_records_btn.setToolTip("이 구단 역대 최다 기간·최다 득점·최다 도움(모든 클럽 공식전) 1~10위, 구단 올해의 선수 2회 이상")
+        self.team_records_btn.clicked.connect(self._open_club_records_dialog)
+        title_row.addSpacing(8)
+        title_row.addWidget(self.team_records_btn)
+        title_row.addStretch(1)
         self.team_copy_btn = QPushButton("📋 기록 복사")
         self.team_copy_btn.setEnabled(False)
         self.team_copy_btn.setToolTip("이 팀의 연도별 기록을 텍스트로 복사합니다(GPT/제미나이 등에 붙여넣기용)")
@@ -5994,6 +6201,8 @@ class WorldBrowserWindow(QDialog):
         (대회 상세 팝업)에서 팀명 칸을 클릭하면 이 메서드를 통해 "팀 검색"
         탭으로 전환하고 그 팀 상세를 띄운다(open_team_by_id 참고)."""
         self.team_detail_title.setText(f"📋 {tname}  역대 기록")
+        self._team_records_target = (tid, tname)   # [2026-11-22] "클럽 기록" 버튼이 여는 팀
+        self.team_records_btn.setEnabled(True)
 
         # [2026-08 신설] 다른 팀을 고르면 표를 통째로 다시 그리므로, 이전
         # 팀에서 펼쳐둔 연도별 포메이션 카드가 있으면(있던 행 인덱스를
@@ -6865,14 +7074,15 @@ class WorldBrowserWindow(QDialog):
         rows = getattr(self, "_player_copy_rows", [])
         intl_records = getattr(self, "_player_copy_intl_records", [])
         text = self._format_player_history_text(name, d, team_hist, rows, intl_records,
-                                                  include_stats=True)
+                                                  include_stats=True,
+                                                  career_totals=getattr(self, "_player_copy_totals", None))
         QGuiApplication.clipboard().setText(text)
         self.player_full_copy_btn.setText("✅ 복사됨")
         QTimer.singleShot(1200, lambda: self.player_full_copy_btn.setText("📋 기록 복사"))
 
     def _format_player_history_text(self, name, d, team_hist, rows, intl_records,
                                      include_stats=False, comp_stats=False, snapshot_year=None,
-                                     snapshot_rows=None, snapshot_keep_late=False):
+                                     snapshot_rows=None, snapshot_keep_late=False, career_totals=None):
         """d(get_ai_player_detail 반환값) + rows(_populate_player_team_box가
         화면 렌더링과 동시에 쌓아둔 연도별 해석 결과: 그 해 나이·소속팀·
         OVR·entry) + intl_records(get_player_intl_records)를 사람이 읽어도,
@@ -6907,8 +7117,10 @@ class WorldBrowserWindow(QDialog):
                 _src = [dict(r, entry=_strip_cutoff_year_cwc(r.get("entry")))
                         if r["year"] == snapshot_year else r for r in _src]
             team_hist = dict(team_hist or {}, awards=_awards_from_year_rows(_src))
+            _title_src = _src
         else:
             _snap_team = None
+            _title_src = rows
 
         # ── 기본 정보 한 줄 (player_detail_tbl 맨 위 요약 행과 동일 로직) ──
         # [2026-09 수정, 신민용 요청: "국적이 🇦🇷 아르헨티나 이런식으로
@@ -6948,28 +7160,19 @@ class WorldBrowserWindow(QDialog):
                 f"주발: {d.get('foot') or '-'} | OVR: {ovr_text} | 소속: {team_text}")
             lines.append("")
 
-            # ── 소속팀 기준 통산 수상 (팀 검색 쪽과 같은 포맷) ──
-            awards = (team_hist or {}).get("awards") or {}
-            award_bits = []
-            if awards.get("league"):
-                award_bits.append(f"리그 우승 {awards['league']}회")
-            if awards.get("cup"):
-                award_bits.append(f"국내컵 우승 {awards['cup']}회")
-            if awards.get("lower_cup_champions"):
-                award_bits.append(f"3부/4부 국내컵 우승 {awards['lower_cup_champions']}회")
-            if awards.get("cl_champions"):
-                award_bits.append(f"챔피언스리그(급) 우승 {awards['cl_champions']}회")
-            if awards.get("el_champions"):
-                award_bits.append(f"유로파리그(급) 우승 {awards['el_champions']}회")
-            if awards.get("ecl_champions"):
-                award_bits.append(f"컨퍼런스리그(급) 우승 {awards['ecl_champions']}회")
-            if awards.get("sc_champions"):
-                award_bits.append(f"슈퍼컵 우승 {awards['sc_champions']}회")
-            if awards.get("dsc_champions"):
-                award_bits.append(f"국내슈퍼컵 우승 {awards['dsc_champions']}회")
-            if awards.get("cwc"):
-                award_bits.append(f"클럽 월드컵 우승 {awards['cwc']}회")
-            lines.append("소속팀 기준 통산 수상: " + (" · ".join(award_bits) if award_bits else "없음"))
+            # ── [2026-11-23 변경, 신민용 요청] 개인 통산 기록 → 대회 이름별 우승 기록 → 한 칸 띄우고 연도별 기록 ──
+            # 예전 "소속팀 기준 통산 수상: 리그 우승 1회 · 국내컵 우승 2회 …" 한 줄을 대신한다.
+            # 통산 득점·도움·A매치는 화면 "통산" 줄과 같은 값(wb.get_player_career_totals, 호출부가 넘김)이고
+            # 지금 기준이라, 그 해 기준 복사(snapshot_year)에는 싣지 않는다(그 해 값이 아니므로).
+            if career_totals and snapshot_year is None:
+                lines.append(f"통산 득점: {career_totals.get('goals', 0)}")
+                lines.append(f"통산 도움: {career_totals.get('assists', 0)}")
+                lines.append(f"A매치 출전: {career_totals.get('caps', 0)}")
+                lines.append(f"A매치 득점: {career_totals.get('intl_goals', 0)}")
+                lines.append(f"A매치 도움: {career_totals.get('intl_assists', 0)}")
+                lines.append("")
+            _titles = _title_lines_from_year_rows(_title_src)
+            lines.extend(_titles if _titles else ["우승 기록 없음"])
             lines.append("")
         else:
             lines.append(f"국적: {nat_text} | 포지션: {d.get('position') or '-'}")
@@ -7816,6 +8019,33 @@ class WorldBrowserWindow(QDialog):
         _enable_plain_copy(self.player_detail_tbl)
         self.player_detail_tbl.hide()
         right_lay.addWidget(self.player_detail_tbl)
+
+        # [2026-11-23 신설, 신민용 요청] 이름·국적 표와 소속팀 대회 기록 사이 "통산" 한 줄 —
+        # 통산 득점 | 통산 도움 | A매치 출전 | A매치 득점 | A매치 도움. 역대 개인상 → 기록 → 세계 표와 같은 기준
+        # (wb.get_player_career_totals): 클럽 기록은 지난 시즌까지, 국가대표는 끝난 대회까지. 위 표와 같은 모양·복사 방식.
+        self.player_totals_tbl = QTableWidget(0, 5)
+        self.player_totals_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.player_totals_tbl.verticalHeader().setVisible(False)
+        self.player_totals_tbl.setShowGrid(True)
+        self.player_totals_tbl.setStyleSheet(
+            "QTableWidget{gridline-color:#000; border:none;}"
+            "QHeaderView::section{background:#252525;color:#888;border:none;padding:5px;}")
+        self.player_totals_tbl.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.player_totals_tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.player_totals_tbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        _tot_tip_all = ("지난 시즌까지의 누적 기록 — 리그·국내컵·클럽 대항전·슈퍼컵·클럽월드컵 + 국가대표 모든 경기"
+                        "(올림픽 포함, 끝난 대회까지)")
+        _tot_tip_a = "A매치 누적 기록 — 실제로 뛴 경기(교체 투입 포함), U-23 올림픽 제외, 끝난 대회까지(출전은 바로)"
+        for _col, (_label, _tip) in enumerate((("통산 득점", _tot_tip_all), ("통산 도움", _tot_tip_all),
+                                                ("A매치 출전", _tot_tip_a), ("A매치 득점", _tot_tip_a),
+                                                ("A매치 도움", _tot_tip_a))):
+            _hitem = QTableWidgetItem(_label)
+            _hitem.setToolTip(_tip)
+            self.player_totals_tbl.setHorizontalHeaderItem(_col, _hitem)
+        self.player_totals_tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        _enable_plain_copy(self.player_totals_tbl)
+        self.player_totals_tbl.hide()
+        right_lay.addWidget(self.player_totals_tbl)
 
         # [2026-08 신설, 신민용 요청: "은퇴했으면... 그 아래에 표시를
         # 해서 몇 년도에 은퇴했는지 표시하는거야"] 아래 "소속팀 대회
@@ -9416,6 +9646,7 @@ class WorldBrowserWindow(QDialog):
         tid, mode = cur
         country, year = r["country"], r["year"]
         _u23 = r.get("kind") == "u23"
+        _pre_first = False   # [2026-11-21] 성인 최종 인원 + 첫 경기 전일 때만 True(아래)
         reserve = []
         tname = dict(wb.get_country_year_olympic_tournaments(country, year) if _u23
                      else wb.get_country_year_callup_tournaments(country, year)).get(tid, "")
@@ -9446,7 +9677,14 @@ class WorldBrowserWindow(QDialog):
             sq = wb.get_country_tournament_squad(tid, country)
             starters, bench = sq.get("starters") or [], sq.get("bench") or []
             players = starters + bench
-            title = f"👥 {year} {tname} — 최종 국대 인원 ({len(players)}명)"
+            # [2026-11-21 신민용 확정 ②(a)] 주전은 대회 첫 경기 때 정해지고 그때 측면 보정으로 후보가 바뀔 수 있다 —
+            # 주전 기록이 없고(조회 함수가 출전순 근사로 11명을 주전 칸에 놓은 상태) AI 누구도 아직 안 뛰었으면 첫 경기
+            # 전으로 보고, 확정 명단처럼 보이지 않게 "소집 명단"으로 표시한다(조회만, 게임 흐름 무관). 주전 기록이 없던
+            # 옛 대회는 출전 기록이 있어 그대로 "최종 국대 인원".
+            _pre_first = bool(players) and bool(sq.get("approx")) and not any(
+                (p_.get("appearances") or 0) for p_ in players if p_.get("id") != getattr(wb, "MY_PLAYER_ID", -1))
+            title = (f"👥 {year} {tname} — 소집 명단 (첫 경기 전 · 확정 전) ({len(players)}명)" if _pre_first
+                     else f"👥 {year} {tname} — 최종 국대 인원 ({len(players)}명)")
             sub = ""
         box = QFrame()
         box.setObjectName("mgr_callup_box")
@@ -9464,7 +9702,9 @@ class WorldBrowserWindow(QDialog):
         _tactics = None if mode == "pool" else self._intl_tactics_info(tid, country, starters)
         _prefix =(f"[{year} {tname} {country} U-23 최종 인원]" if _u23 else
                    f"[{year} {tname} {country} 대표팀 후보군]"
-                   if mode == "pool" else f"[{year} {tname} {country} 최종 국대 인원]")
+                   if mode == "pool" else
+                   (f"[{year} {tname} {country} 소집 명단 (첫 경기 전 · 확정 전)]" if _pre_first
+                    else f"[{year} {tname} {country} 최종 국대 인원]"))
         if players:
             rb = QPushButton("✏ 이름 일괄변경")
             rb.setStyleSheet(self._CALLUP_BTN_QSS)
@@ -10602,6 +10842,7 @@ class WorldBrowserWindow(QDialog):
             self.player_detail_placeholder.setText("← 왼쪽에서 선수를 선택하세요")
             self.player_detail_placeholder.show()
             self.player_detail_tbl.hide()
+            self.player_totals_tbl.hide()
             self.player_retirement_note.hide()
             self.player_team_tbl.setRowCount(0)
             self.player_team_award_tbl.setRowCount(0)
@@ -10648,6 +10889,7 @@ class WorldBrowserWindow(QDialog):
         # 이름을, 없으면 기존처럼 ai_player_code(id)를 표시한다.
         code = d["name"] if player_id == wb.MY_PLAYER_ID else (d.get("custom_name") or ai_player_code(player_id))
         self._fill_player_detail_row(code, d)
+        self._fill_player_totals_row(player_id)
         # [2026-08 신설] 복사 버튼이 재조회 없이 쓸 수 있도록 기본 정보를
         # 인스턴스에 저장해둔다 — 연도별 기록/국가대표 기록은 아래에서
         # 각각 _populate_player_team_box/_populate_player_intl_box가 채운다.
@@ -11037,6 +11279,28 @@ class WorldBrowserWindow(QDialog):
             tbl.setItem(0, col, item)
         self._resize_self_sizing_table(tbl)
         self.player_detail_placeholder.hide()
+        tbl.show()
+
+    def _fill_player_totals_row(self, player_id):
+        """[2026-11-23 신설] 선수 상세 "통산" 한 줄 채우기(wb.get_player_career_totals — 선수 한 명 몫만 읽는다)."""
+        tbl = self.player_totals_tbl
+        self._player_copy_totals = None
+        try:
+            t = wb.get_player_career_totals(player_id)
+        except Exception as _e:
+            print(f"[WB] 통산 기록 조회 실패 (선수 {player_id}): {_e}")
+            tbl.hide()
+            return
+        self._player_copy_totals = t   # [2026-11-23] "기록 복사" 맨 위 통산 기록 — 화면 값 그대로
+        tbl.setRowCount(1)
+        for col, key in enumerate(("goals", "assists", "caps", "intl_goals", "intl_assists")):
+            item = QTableWidgetItem(str(t.get(key, 0)))
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            tip = self.player_totals_tbl.horizontalHeaderItem(col)
+            if tip is not None:
+                item.setToolTip(tip.toolTip())
+            tbl.setItem(0, col, item)
+        self._resize_self_sizing_table(tbl)
         tbl.show()
 
     def _player_team_expanded_years(self, player_id):
@@ -11783,7 +12047,10 @@ class WorldBrowserWindow(QDialog):
                 "year": entry["year"], "age": age, "is_retired_row": False,
                 "team_name": player_team_name, "position": player_position,
                 "ovr": ovr_at_year, "role": role_at_year, "entry": entry, "stat": _stat,
-                "awards": _year_awards, "late_awards": _late_awards_by_year.get(entry["year"])})
+                "awards": _year_awards, "late_awards": _late_awards_by_year.get(entry["year"]),
+                # [2026-11-23] 기록 복사 우승 기록의 나라 표시("코파 MX (멕시코)") — 소속팀 칸 아래 국가와 같은 값
+                "team_country": (_tc_by_id.get(_team_id_for_entry(entry))
+                                 or _tc_by_name.get(player_team_name))})
 
             lg_txt = entry["league"] or "-"
             lg_color = wb.league_text_color(lg_txt, entry.get("league_champion"))   # [18번]
@@ -12164,7 +12431,9 @@ class WorldBrowserWindow(QDialog):
             "QPushButton:hover:!checked{color:#ccc;}")
         _stage_seg = QHBoxLayout()
         _stage_seg.setSpacing(0)
-        for _i, (_label, _key) in enumerate((("전체", None), ("본선", "finals"), ("예선", "qual"))):
+        # [2026-11-22 신설, 신민용 요청] 맨 끝 "기록" — 같은 묶음 버튼이라 누르면 아래 표 대신 그 나라 A매치 개인 기록
+        # (최다 출전·득점·도움)이 뜨고, 전체/본선/예선을 누르면 원래 대회 기록 표로 돌아간다.
+        for _i, (_label, _key) in enumerate((("전체", None), ("본선", "finals"), ("예선", "qual"), ("기록", "records"))):
             _b = QPushButton(_label)
             _b.setCheckable(True)
             _b.setAutoDefault(False)
@@ -12172,7 +12441,7 @@ class WorldBrowserWindow(QDialog):
             _b.setCursor(Qt.CursorShape.PointingHandCursor)
             _b.setProperty("stage_key", _key)
             _radius = ("border-top-left-radius:4px;border-bottom-left-radius:4px;" if _i == 0 else
-                       "border-top-right-radius:4px;border-bottom-right-radius:4px;" if _i == 2 else "")
+                       "border-top-right-radius:4px;border-bottom-right-radius:4px;" if _i == 3 else "")
             _b.setStyleSheet(_stage_btn_style.replace("font-size:11px;}", f"font-size:11px;{_radius}}}", 1))
             if _key is None:
                 _b.setChecked(True)
@@ -12220,9 +12489,14 @@ class WorldBrowserWindow(QDialog):
         # 화면이라 그 국가 관점의 경기 로그를 표 안에서 바로 펼쳐 보여주는
         # 쪽이 요청에 맞다 — 팝업 대신 인라인 확장으로 교체.
         self.country_detail_tbl.cellClicked.connect(self._on_country_detail_cell_clicked)
-        right_lay.addWidget(self.country_detail_tbl, 1)
+        # [2026-11-22] 대회 기록 표(0) ↔ "기록" 버튼의 A매치 개인 기록(1)
+        self._country_detail_stack = QStackedWidget()
+        self._country_detail_stack.addWidget(self.country_detail_tbl)
+        self._country_detail_stack.addWidget(self._build_country_amatch_records_widget())
+        right_lay.addWidget(self._country_detail_stack, 1)
         hint = QLabel("💡 연도를 클릭하면 경기 기록이, 대회명을 클릭하면 그 당시 주전/후보 명단이 펼쳐지고, 종류를 클릭하면 대회 전체 일정을 볼 수 있어요")
         hint.setStyleSheet("color:#666;font-size:10px;")
+        self._country_detail_hint = hint
         right_lay.addWidget(hint)
 
         split.addWidget(right)
@@ -12450,6 +12724,15 @@ class WorldBrowserWindow(QDialog):
         _stage_grp = getattr(self, "country_result_stage_group", None)
         _stage_btn = _stage_grp.checkedButton() if _stage_grp is not None else None
         stage_key = _stage_btn.property("stage_key") if _stage_btn is not None else None
+        # [2026-11-22] "기록" — A매치 개인 기록 화면(종류 필터는 대회 표 전용이라 꺼 둔다)
+        _rec = stage_key == "records"
+        if getattr(self, "_country_detail_stack", None) is not None:
+            self._country_detail_stack.setCurrentIndex(1 if _rec else 0)
+            self.country_result_kind_combo.setEnabled(not _rec)
+            self._country_detail_hint.setVisible(not _rec)
+        if _rec:
+            self._refresh_country_amatch_records()
+            return
         if stage_key:
             results = [t for t in results if self._country_result_stage(t) == stage_key]
 
@@ -14478,10 +14761,773 @@ class WorldBrowserWindow(QDialog):
             stack.addWidget(builder())
         self._ia_cat_buttons["world"].setChecked(True)
         self._ia_cat_group = cat_group  # GC 방지용 참조 보관
+        # [2026-11-22 신설, 신민용 요청] 맨 윗줄 "기록" 버튼 — 다회 수상 순위 화면(_build_ia_records_panel).
+        # [2026-11-23 신민용 요청] 오른쪽 끝 대신 "컵대회" 바로 오른쪽에 붙인다(빈 공간은 기록 버튼 뒤로).
+        # 분류 버튼과 같은 그룹이라 누르면 다른 분류 버튼이 꺼지고, 다른 분류를 누르면 원래 화면으로 돌아간다.
+        # 누를 때마다 표를 다시 채운다(시즌이 지나 수상 기록이 늘었을 수 있음 — 조회 1~2번이라 가볍다).
+        rec_btn = QPushButton("기록")
+        rec_btn.setCheckable(True)
+        rec_btn.setAutoDefault(False)
+        rec_btn.setDefault(False)
+        rec_btn.setStyleSheet(_CAT_TOGGLE_STYLE)
+        rec_btn.setToolTip("역대 개인상 다회 수상 순위 (2회 이상)")
+        _rec_idx = stack.count()
+        stack.addWidget(self._build_ia_records_panel())
+        rec_btn.clicked.connect(lambda _checked, i=_rec_idx: (self._ia_stack.setCurrentIndex(i),
+                                                              self._refresh_ia_records()))
+        cat_group.addButton(rec_btn)
+        cat_bar.addWidget(rec_btn)
         cat_bar.addStretch()
+        self._ia_cat_buttons["records"] = rec_btn
         lay.addLayout(cat_bar)
         lay.addWidget(stack, 1)
         return w
+
+    # [2026-11-22 신설, 신민용 요청: "기록 버튼 — 역대 발롱·야신상 2회 이상 받은 선수 순위, 세계상 버튼 안에
+    # 발롱·야신 표시(나중에 기록을 추가할 수 있으니)"] 위쪽에 묶음 버튼(지금은 "세계상" 하나,
+    # wb.AWARD_RECORD_GROUPS), 아래에 그 묶음의 상 표를 좌우로 나란히. 표: 순위 | 선수 | 횟수 | 수상 연도 | 국적 |
+    # 현재 소속(은퇴면 "은퇴"). 선수 행 더블클릭 → 선수 상세(다른 개인상 표와 같음).
+    def _build_ia_records_panel(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 8, 0, 0)
+        bar = QHBoxLayout()
+        _style = ("QPushButton{background:#2a2a2a;color:#888;border:1px solid #3a3a3a;"
+                  "border-radius:4px;padding:4px 10px;font-size:11px;}"
+                  "QPushButton:checked{background:#0d3d1a;color:#00cc44;border-color:#00cc44;}")
+        grp = QButtonGroup(w)
+        grp.setExclusive(True)
+        stack = QStackedWidget()
+        self._ia_rec_stack = stack
+        self._ia_rec_group = grp   # GC 방지용 참조 보관
+        self._ia_rec_tables = {}   # award_type → (제목 라벨, 표)
+        for gi, (key, label, awards) in enumerate(wb.AWARD_RECORD_GROUPS):
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setAutoDefault(False)
+            btn.setDefault(False)
+            btn.setStyleSheet(_style)
+            if key == "league":
+                # [2026-11-22 신설] 리그 개인 기록(나라·부수 필터) — 상 표 대신 전용 화면, 누를 때 다시 채운다
+                btn.clicked.connect(lambda _checked, i=gi: (self._ia_rec_stack.setCurrentIndex(i),
+                                                            self._refresh_ia_league_records()))
+            elif key == "alltime":
+                # [2026-11-22 신설] 세계 역대 순위(A매치 3표 + 모든 경기 통산 2표) — 전용 화면, 누를 때 다시 채운다
+                btn.clicked.connect(lambda _checked, i=gi: (self._ia_rec_stack.setCurrentIndex(i),
+                                                            self._refresh_ia_alltime_records()))
+            elif key == "club":
+                # [2026-11-22 신설] 클럽 대항전(대륙·대회 필터) 최다 득점·도움 — 전용 화면, 누를 때 다시 채운다
+                btn.clicked.connect(lambda _checked, i=gi: (self._ia_rec_stack.setCurrentIndex(i),
+                                                            self._refresh_ia_club_comp_records()))
+            else:
+                btn.clicked.connect(lambda _checked, i=gi: self._ia_rec_stack.setCurrentIndex(i))
+            grp.addButton(btn)
+            bar.addWidget(btn)
+            if gi == 0:
+                btn.setChecked(True)
+            if key == "league":
+                self._ia_rec_league_idx = gi
+                stack.addWidget(self._build_ia_league_records_page())
+                continue
+            if key == "alltime":
+                self._ia_rec_alltime_idx = gi
+                stack.addWidget(self._build_ia_alltime_records_page())
+                continue
+            if key == "club":
+                self._ia_rec_club_idx = gi
+                stack.addWidget(self._build_ia_club_comp_records_page())
+                continue
+            page = QWidget()
+            # [2026-11-23] 상 목록이 줄 단위(튜플의 튜플)면 줄마다 나눠 위아래로 쌓는다(wb.AWARD_RECORD_GROUPS 참고).
+            _rows_awards = awards if (awards and isinstance(awards[0], tuple)) else (awards,)
+            _page_lay = QVBoxLayout(page)
+            _page_lay.setContentsMargins(0, 0, 0, 0)
+            _page_lay.setSpacing(10)
+            for _row_awards in _rows_awards:
+                row = QHBoxLayout()
+                row.setSpacing(12)
+                _page_lay.addLayout(row, 1)
+                for award in _row_awards:
+                    col = QVBoxLayout()
+                    title = QLabel(f"{award} 다회 수상 ({wb.AWARD_RECORD_MIN_WINS}회 이상)")
+                    _color = wb.WORLD_AWARD_STYLE.get(award, (0, "#ffcc00"))[1]
+                    title.setStyleSheet(f"color:{_color};font-size:13px;font-weight:bold;")
+                    col.addWidget(title)
+                    tbl = QTableWidget(0, 0)
+                    tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+                    tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+                    tbl.verticalHeader().setVisible(False)
+                    tbl.cellDoubleClicked.connect(lambda r_, _c, t=tbl: self._on_ia_player_row_clicked(t, r_))
+                    _enable_plain_copy(tbl)
+                    col.addWidget(tbl, 1)
+                    row.addLayout(col, 1)
+                    self._ia_rec_tables[award] = (title, tbl)
+            stack.addWidget(page)
+        bar.addStretch()
+        lay.addLayout(bar)
+        lay.addWidget(stack, 1)
+        return w
+
+    def _refresh_ia_records(self):
+        """기록 화면의 모든 표를 다시 채운다(기록 버튼을 누를 때·이름이 바뀔 때). 화면을 만든 적 없으면 스킵.
+        [2026-11-23] 세계상 표 8개는 조회 한 번(wb.get_award_multi_winners_many)으로 채운다."""
+        _tables = getattr(self, "_ia_rec_tables", {})
+        _data = wb.get_award_multi_winners_many(list(_tables)) if _tables else {}
+        for award, (_title, tbl) in _tables.items():
+            self._fill_ia_record_table(tbl, _data.get(award) or [], award)
+        _st = getattr(self, "_ia_rec_stack", None)
+        if _st is not None and _st.currentIndex() == getattr(self, "_ia_rec_league_idx", -1):
+            self._refresh_ia_league_records()
+        if _st is not None and _st.currentIndex() == getattr(self, "_ia_rec_alltime_idx", -1):
+            self._refresh_ia_alltime_records()
+        if _st is not None and _st.currentIndex() == getattr(self, "_ia_rec_club_idx", -1):
+            self._refresh_ia_club_comp_records()
+
+    # [2026-11-22 변경, 신민용 요청] 칸 순서: 순위 | 선수 | 국적 | 포지션(주포) | 횟수 | 수상 연도 | 현재 소속.
+    def _fill_ia_record_table(self, tbl, rows, award):
+        cols = ["순위", "선수", "국적", "포지션", "횟수", "수상 연도", "현재 소속"]
+        _YEARS_COL, _TEAM_COL = 5, 6
+        tbl.clear()
+        tbl.setRowCount(len(rows))
+        tbl.setColumnCount(len(cols))
+        tbl.setHorizontalHeaderLabels(cols)
+        hdr = tbl.horizontalHeader()
+        hdr.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        # [2026-11-23 변경, 신민용 요청: "1줄에 4개씩"] 칸은 모두 내용 맞춤(연도 칸 = 4개 한 줄 너비, 이름도 안 잘림) —
+        # 남는 폭·가로 스크롤은 _install_fit_columns(채운 뒤 _apply_years_wrap에서).
+        self._install_years_wrap(tbl, _YEARS_COL)
+        for i, r in enumerate(rows):
+            years = ", ".join(str(y) for y in r["years"])
+            team = "은퇴" if r["retired"] else (r["team_name"] or "")
+            vals = [str(r["rank"]), r["name"], r["nationality"], r.get("position") or "-",
+                    f"{r['wins']}회", years, team]
+            for j, v in enumerate(vals):
+                cell = QTableWidgetItem(v)
+                cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if j == 0:
+                    cell.setData(Qt.ItemDataRole.UserRole, r["player_id"])
+                if j == _YEARS_COL:
+                    cell.setToolTip(f"{award} 수상: {years}")
+                    cell.setData(_YEARS_ROLE, list(r["years"]))
+                if r["player_id"] == wb.MY_PLAYER_ID:
+                    cell.setForeground(Qt.GlobalColor.green)
+                elif j == _TEAM_COL and r["retired"]:
+                    cell.setForeground(QColor("#888888"))
+                tbl.setItem(i, j, cell)
+        self._show_empty_state(tbl, rows, f"아직 {wb.AWARD_RECORD_MIN_WINS}회 이상 수상한 선수가 없습니다", len(cols))
+        self._apply_years_wrap(tbl, force=True)
+
+    # [2026-11-23 신설, 신민용 요청: "수상 연도가 많으면 ....으로 잘린다 — 한 줄에 연도 4개씩"]
+    # 다회 수상 표(세계상·리그 MVP·구단 올해의 선수)의 "수상 연도" 칸 — 한 줄에 연도 4개씩 놓고 다음 줄로 넘긴다
+    # ("2007, 2008, 2009, 2010," / "2014"). 원본 연도 목록은 칸의 _YEARS_ROLE에 둔다.
+    # [2026-11-23 변경, 신민용 요청: "1줄에 4개씩이라 했잖아"] 예전엔 칸 너비에 맞춰 1~4개로 줄였다(좁은 창에서
+    # 1줄에 1개). 이제 창 크기와 상관없이 항상 4개 — 연도 칸은 내용 맞춤이라 4개 한 줄이 늘 들어가고,
+    # 창이 좁으면 선수 칸이 줄어든다.
+    _YEARS_PER_LINE_MAX = 4
+
+    @staticmethod
+    def _years_lines(years, per_line):
+        chunks = [", ".join(str(y) for y in years[k:k + per_line]) for k in range(0, len(years), per_line)]
+        return ",\n".join(chunks)
+
+    def _years_per_line(self, tbl, col):
+        return self._YEARS_PER_LINE_MAX
+
+    def _install_years_wrap(self, tbl, col):
+        """표마다 한 번 — 수상 연도 칸 너비가 바뀌면 다음 이벤트 차례에 줄바꿈을 다시 한다."""
+        tbl._years_wrap_col = col
+        _install_row_refresh(tbl)   # [2026-11-24] 창이 뜰 때 글꼴 기준으로 줄 높이·칸 폭 다시 재기
+        if getattr(tbl, "_years_wrap_on", False):
+            return
+        tbl._years_wrap_on = True
+        tbl._years_wrap_n = None
+        tbl._years_wrap_pending = False
+
+        def _on_resized(idx, _old, _new, t=tbl):
+            try:
+                if idx != t._years_wrap_col or t._years_wrap_pending:
+                    return
+                t._years_wrap_pending = True
+            except RuntimeError:
+                return
+
+            def _run(t=t):
+                try:
+                    t._years_wrap_pending = False
+                    self._apply_years_wrap(t)
+                except RuntimeError:
+                    pass   # 표가 이미 닫힘(클럽 기록 창 등)
+            QTimer.singleShot(0, _run)
+        tbl.horizontalHeader().sectionResized.connect(_on_resized)
+
+    def _apply_years_wrap(self, tbl, force=False):
+        col = getattr(tbl, "_years_wrap_col", None)
+        if col is None:
+            return
+        n = self._years_per_line(tbl, col)
+        if not force and n == getattr(tbl, "_years_wrap_n", None):
+            return
+        tbl._years_wrap_n = n
+        changed = False
+        for r in range(tbl.rowCount()):
+            it = tbl.item(r, col)
+            ys = it.data(_YEARS_ROLE) if it is not None else None
+            if ys:
+                it.setText(self._years_lines(list(ys), n))
+                changed = True
+        if changed:
+            tbl.resizeRowsToContents()
+            self._fix_pair_row_heights(tbl)   # [2026-11-23] 구단 올해의 선수 표 기간 줄
+        if force:
+            _install_fit_columns(tbl)
+
+    # [2026-11-22 신설, 신민용 요청] 선수 기록 순위 표 공용 채우기 — 국가 A매치 기록(국적 칸 없음: 같은 나라)과
+    # 리그 기록(국적 칸 있음)이 같이 쓴다. 순위 | 이름 | 주포 | (국적) | 값. 1~10위(10위 동점자까지), 같은 값은 같은 순위
+    # (wb._record_rank_rows). 이름 칸 = 선수 이름. 선수 행 더블클릭 → 선수 상세, 내 선수는 초록, 은퇴 선수는 이름 툴팁에 "은퇴".
+    # [2026-11-22] "주포" 칸 추가(신민용 요청 — 1~10위 표 전부): 현역은 지금 주포지션, 은퇴 선수는 은퇴 당시.
+    def _fill_record_rank_table(self, tbl, rows, value_label, show_nat, empty_msg, period_tip=None, year_label=None):
+        # value_label None = 값 칸 없음(구단 기록 "최다 기간" — 연수는 아래 기간 줄 오른쪽 칸에만).
+        # [2026-11-24] year_label = 맨 오른쪽 연도 칸(세계 "단일 시즌" 표 — 행의 "year").
+        cols = (["순위", "이름", "주포"] + (["국적"] if show_nat else []) + ([value_label] if value_label else [])
+                + ([year_label] if year_label else []))
+        # [2026-11-23 신설, 신민용 확정] 행에 "period"가 있으면(국가 A매치·세계 A매치·클럽 기록 표) 선수 줄 아래에
+        # 한 줄 더: [활동 기간(순위~국적 칸을 합친 넓은 칸) | N년(값 칸 — 내용 맞춤이라 "5년"·"10년"에 맞게 늘고 준다)].
+        # 두 줄은 한 묶음 — 선택하면 같이 칠해지고, 어느 줄을 더블클릭해도 그 선수 상세(두 줄 모두 0번 칸에 선수 id).
+        paired = any(r.get("period") for r in rows)
+        step = 2 if paired else 1
+        tbl.clear()
+        tbl.clearSpans()
+        tbl.setRowCount(len(rows) * step)
+        tbl.setColumnCount(len(cols))
+        tbl.setHorizontalHeaderLabels(cols)
+        hdr = tbl.horizontalHeader()
+        hdr.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        last = len(cols) - 1
+        for i, r in enumerate(rows):
+            vals = ([str(r["rank"]), r["name"], r.get("position") or "-"]
+                    + ([r["nationality"]] if show_nat else []) + ([str(r["value"])] if value_label else [])
+                    + ([str(r.get("year") or "-")] if year_label else []))
+            tip = (f"{r['name']} — 은퇴" if r["retired"] else
+                   f"{r['name']} — {r['team_name']}" if r.get("team_name") else r["name"])
+            ri = i * step
+            for j, v in enumerate(vals):
+                cell = QTableWidgetItem(v)
+                cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if j == 0:
+                    cell.setData(Qt.ItemDataRole.UserRole, r["player_id"])
+                if j == 1:
+                    cell.setToolTip(tip)
+                if r["player_id"] == wb.MY_PLAYER_ID:
+                    cell.setForeground(Qt.GlobalColor.green)
+                tbl.setItem(ri, j, cell)
+            if paired:
+                per = r.get("period") or "-"
+                yrs = f"{r['period_years']}년" if r.get("period_years") else ""
+                _c = QColor("#7fbf7f") if r["player_id"] == wb.MY_PLAYER_ID else QColor("#9a9a9a")
+                p_cell = QTableWidgetItem(per)
+                p_cell.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+                p_cell.setData(Qt.ItemDataRole.UserRole, r["player_id"])
+                # 합친 칸은 줄 높이 계산 때 첫 칸 폭으로만 재여서 긴 기간이 여러 줄로 잡혔다 — 한 줄 높이로 고정
+                p_cell.setData(Qt.ItemDataRole.SizeHintRole, QSize(1, tbl.fontMetrics().height() + 4))
+                p_cell.setForeground(_c)
+                p_cell.setToolTip(f"{r['name']} — {period_tip or '활동 기간'}: {per}" + (f" ({yrs})" if yrs else ""))
+                tbl.setItem(ri + 1, 0, p_cell)
+                for j in range(1, last):
+                    tbl.setItem(ri + 1, j, QTableWidgetItem(""))
+                y_cell = QTableWidgetItem(yrs)
+                y_cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                y_cell.setForeground(_c)
+                tbl.setItem(ri + 1, last, y_cell)
+        self._show_empty_state(tbl, rows, empty_msg, len(cols))
+        if paired:
+            for i in range(len(rows)):
+                tbl.setSpan(i * step + 1, 0, 1, last)
+            tbl.resizeRowsToContents()
+        tbl._paired_rows = paired
+        self._fix_pair_row_heights(tbl)
+        self._install_pair_selection(tbl)
+
+    @staticmethod
+    def _fix_pair_row_heights(tbl):
+        """[2026-11-23] 두 줄 묶음 표의 기간 줄(홀수 행)은 한 줄 높이로 — 합친 칸은 Qt가 첫 칸 폭으로만 재서 긴 기간
+        ("1998~2005, 2007~현재")을 여러 줄로 잡아 줄이 불필요하게 높아졌다. 줄 높이를 다시 잰 뒤마다 부른다."""
+        if not getattr(tbl, "_paired_rows", False):
+            return
+        h = tbl.fontMetrics().height() + 5
+        for r in range(1, tbl.rowCount(), 2):
+            tbl.setRowHeight(r, h)
+
+    @staticmethod
+    def _install_pair_selection(tbl):
+        """[2026-11-23] 두 줄 묶음 표(_paired_rows) — 한 줄을 고르면 짝 줄(선수 줄 ↔ 기간 줄)도 같이 고른다. 표마다 한 번."""
+        _install_row_refresh(tbl)   # [2026-11-24] 창이 뜰 때 글꼴 기준으로 줄 높이 다시 재기
+        if getattr(tbl, "_pair_sel_on", False):
+            return
+        tbl._pair_sel_on = True
+        tbl._pair_sel_busy = False
+
+        def _sync(t=tbl):
+            try:
+                if not getattr(t, "_paired_rows", False) or t._pair_sel_busy:
+                    return
+                sm = t.selectionModel()
+                rows = {ix.row() for ix in sm.selectedIndexes()}
+                want = {r ^ 1 for r in rows} - rows
+                want = {r for r in want if 0 <= r < t.rowCount()}
+                if not want:
+                    return
+                t._pair_sel_busy = True
+                try:
+                    from PyQt6.QtCore import QItemSelectionModel
+                    for r in want:
+                        sm.select(t.model().index(r, 0), QItemSelectionModel.SelectionFlag.Select
+                                  | QItemSelectionModel.SelectionFlag.Rows)
+                finally:
+                    t._pair_sel_busy = False
+            except RuntimeError:
+                pass
+        tbl.itemSelectionChanged.connect(_sync)
+
+    def _make_record_rank_column(self, title_text, color="#ffcc00"):
+        """제목 라벨 + 순위 표 한 칸(QVBoxLayout, 표)."""
+        col = QVBoxLayout()
+        title = QLabel(title_text)
+        title.setStyleSheet(f"color:{color};font-size:13px;font-weight:bold;")
+        col.addWidget(title)
+        tbl = QTableWidget(0, 0)
+        tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        tbl.verticalHeader().setVisible(False)
+        tbl.cellDoubleClicked.connect(lambda r_, _c, t=tbl: self._on_ia_player_row_clicked(t, r_))
+        _enable_plain_copy(tbl)
+        col.addWidget(tbl, 1)
+        return col, tbl
+
+    # 국가 검색 → "기록": 그 나라 A매치 최다 출전·득점·도움 세 표를 나란히.
+    _AMATCH_RECORD_KINDS = (("caps", "A매치 최다 출전", "출전"), ("goals", "A매치 최다 득점", "득점"),
+                            ("assists", "A매치 최다 도움", "도움"))
+
+    def _build_country_amatch_records_widget(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 4, 0, 0)
+        self._country_amatch_note = QLabel(
+            "실제로 경기에 뛴 A매치만 셉니다(명단에만 있고 안 뛴 경기 제외, 교체 투입은 출전) · U-23 올림픽 제외 · "
+            "득점·도움은 대회가 끝나면 반영 · 1~10위(같은 기록은 같은 순위) · "
+            "선수 아래 줄: 대표팀 활동 기간(최초 소집~마지막 소집, 안 뛴 소집 포함) | 연수")
+        self._country_amatch_note.setStyleSheet("color:#888;font-size:11px;")
+        self._country_amatch_note.setWordWrap(True)
+        lay.addWidget(self._country_amatch_note)
+        row = QHBoxLayout()
+        row.setSpacing(12)
+        self._country_amatch_tables = {}
+        for key, title, _vl in self._AMATCH_RECORD_KINDS:
+            col, tbl = self._make_record_rank_column(title)
+            row.addLayout(col, 1)
+            self._country_amatch_tables[key] = tbl
+        lay.addLayout(row, 1)
+        return w
+
+    def _refresh_country_amatch_records(self):
+        name = getattr(self, "_country_copy_name", None)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)   # 나라를 처음 열 때 기록을 모으는 동안(대개 짧다)
+        try:
+            data = wb.get_country_amatch_records(name) if name else {}
+        finally:
+            QApplication.restoreOverrideCursor()
+        for key, _title, vl in self._AMATCH_RECORD_KINDS:
+            self._fill_record_rank_table(
+                self._country_amatch_tables[key], data.get(key) or [], vl, False,
+                "← 왼쪽에서 국가를 선택하세요" if not name else "아직 기록이 없습니다",
+                period_tip="국가대표 활동 기간(최초 소집~마지막 소집 — 최종 명단에 든 대회, 안 뛴 소집 포함, U-23 올림픽 제외)")
+
+    # 역대 개인상 → 기록 → "세계": 위 줄 A매치 출전·득점·도움, 가운데 줄 모든 경기 통산 득점·도움,
+    # [2026-11-24 신설, 신민용 요청] 아래 줄 단일 시즌 최다 득점·도움(클럽 기록만, 한 줄 = 한 선수의 한 시즌, 기록 년도 칸)
+    # (각 1~10위).
+    _ALLTIME_ROWS = ((("caps", "역대 A매치 출전", "출전"), ("goals", "역대 A매치 득점", "득점"),
+                      ("assists", "역대 A매치 도움", "도움")),
+                     (("all_goals", "역대 통산 득점 (모든 경기)", "득점"), ("all_assists", "역대 통산 도움 (모든 경기)", "도움")),
+                     (("season_goals", "단일 시즌 최다 득점 (클럽)", "득점"), ("season_assists", "단일 시즌 최다 도움 (클럽)", "도움")))
+    _SEASON_RECORD_KEYS = ("season_goals", "season_assists")
+
+    def _build_ia_alltime_records_page(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        note = QLabel("A매치: 실제로 뛴 경기만(교체 투입 포함) · U-23 올림픽 제외 · 여러 나라 대표 기록은 합산 | "
+                      "통산: 리그·국내컵·클럽 대항전·슈퍼컵·클럽월드컵·국가대표(올림픽 포함) 합산 | "
+                      "단일 시즌: 그 시즌 리그·국내컵·클럽 대항전·슈퍼컵·클럽월드컵 합산(국가대표 제외, 시즌 중 이적하면 두 팀 합산), "
+                      "같은 선수가 여러 시즌 오를 수 있음 | "
+                      "시즌·대회가 끝난 기록까지 · 1~10위(같은 기록은 같은 순위, 같은 기록이면 이른 시즌이 위) | "
+                      "A매치 표 선수 아래 줄: 대표팀 활동 기간(최초 소집~마지막 소집, 안 뛴 소집 포함) | 연수")
+        note.setStyleSheet("color:#888;font-size:11px;")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        self._ia_at_tables = {}
+        for kinds in self._ALLTIME_ROWS:
+            row = QHBoxLayout()
+            row.setSpacing(12)
+            for key, title, vl in kinds:
+                col, tbl = self._make_record_rank_column(title)
+                row.addLayout(col, 1)
+                self._ia_at_tables[key] = (tbl, vl)
+            lay.addLayout(row, 1)
+        return page
+
+    def _refresh_ia_alltime_records(self):
+        if not hasattr(self, "_ia_at_tables"):
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)   # 오프시즌 뒤 처음 열 때만 통산 기록을 모은다
+        try:
+            data = dict(wb.get_world_alltime_records())
+            data.update(wb.get_world_season_records())   # [2026-11-24] 단일 시즌 최다 득점·도움
+        finally:
+            QApplication.restoreOverrideCursor()
+        _pending = bool(data.get("pending"))   # 예전 세이브 첫 불러오기 직후 — 단일 시즌 기록을 뒤에서 모으는 중
+        for key, (tbl, vl) in self._ia_at_tables.items():
+            _empty = ("단일 시즌 기록을 처음 한 번 모으는 중입니다 — 잠시 뒤 다시 열어 주세요"
+                      if _pending and key in self._SEASON_RECORD_KEYS else "아직 기록이 없습니다")
+            self._fill_record_rank_table(tbl, data.get(key) or [], vl, True, _empty,
+                                         period_tip="국가대표 활동 기간(최초 소집~마지막 소집 — 최종 명단에 든 대회, 안 뛴 소집 포함, U-23 올림픽 제외)",
+                                         year_label="기록 년도" if key in self._SEASON_RECORD_KEYS else None)
+
+    # [2026-11-22 신설, 신민용 요청: "팀 검색 → ㅁㅁ 역대 기록 → 클럽 기록"] 창 하나에 표 3개를 나란히:
+    # 최다 득점·최다 도움(순위 | 이름 | 주포 | 국적 | 값 — 모든 클럽 공식전, 국가대표 제외) · 구단 올해의 선수 2회 이상
+    # (순위 | 선수 | 국적 | 포지션 | 횟수 | 수상 연도). 선수 행 더블클릭 → 선수 상세. 창은 하나만(새로 열면 이전 것을 닫음).
+    def _open_club_records_dialog(self):
+        target = getattr(self, "_team_records_target", None)
+        if not target:
+            return
+        tid, tname = target
+        old = getattr(self, "_club_records_dialog", None)
+        if old is not None:
+            try:
+                old.close()
+            except RuntimeError:
+                pass
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"{tname} 구단 기록")
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        dlg.resize(1600, 900)
+        lay = QVBoxLayout(dlg)
+        head = QLabel(f"🏟 {tname} 구단 기록")
+        head.setStyleSheet("color:#00cc44;font-size:15px;font-weight:bold;")
+        lay.addWidget(head)
+        note = QLabel("최다 기간: 이 구단 소속 연수(지금 소속이면 올해까지) · "
+                      "득점·도움: 이 구단에서 뛴 모든 클럽 공식전(리그·국내컵·클럽 대항전·슈퍼컵·클럽월드컵) 합산, "
+                      "국가대표 제외 · 시즌 중 이적생은 뛴 팀에 나눠 반영 · 시즌이 끝난 기록까지 · 1~10위(같은 기록은 같은 순위) · "
+                      "선수 아래 줄: 이 구단 소속 기간(임대는 임대 간 팀, 시즌 중 이적한 해는 양쪽) | 연수 · "
+                      "단일 시즌: 한 시즌에 이 구단 소속으로 낸 기록(같은 선수가 여러 시즌 오를 수 있음, 같은 기록이면 이른 시즌이 위)")
+        note.setStyleSheet("color:#888;font-size:11px;")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        row = QHBoxLayout()
+        row.setSpacing(12)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            data = wb.get_club_player_records(tid)
+            poty = wb.get_club_poty_multi_winners(tid)
+            tenure = wb.get_club_tenure_records(tid)   # [2026-11-24] 최다 기간
+            season = wb.get_club_season_records(tid)   # [2026-11-24] 단일 시즌 최다 득점·도움
+        finally:
+            QApplication.restoreOverrideCursor()
+        # [2026-11-24 신설, 신민용 요청] 순서: 최다 기간 | 최다 득점 | 최다 도움 | 구단 올해의 선수.
+        # 최다 기간은 위 줄 순위 | 이름 | 주포 | 국적만, 아래 줄에 기간(좌) | 연수(우).
+        col, tbl = self._make_record_rank_column("최다 기간")
+        self._fill_record_rank_table(tbl, tenure or [], None, True, "아직 기록이 없습니다",
+                                     period_tip="이 구단 소속 기간(임대는 임대 간 팀, 시즌 중 이적한 해는 양쪽 팀)")
+        row.addLayout(col, 1)
+        for key, title, vl in (("goals", "최다 득점", "득점"), ("assists", "최다 도움", "도움")):
+            col, tbl = self._make_record_rank_column(title)
+            self._fill_record_rank_table(tbl, data.get(key) or [], vl, True, "아직 기록이 없습니다",
+                                         period_tip="이 클럽 소속 기간(임대는 임대 간 팀, 시즌 중 이적한 해는 양쪽 팀)")
+            row.addLayout(col, 1)
+        col, tbl = self._make_record_rank_column(f"구단 올해의 선수 ({wb.CLUB_POTY_MIN_WINS}회 이상)")
+        self._fill_club_poty_table(tbl, poty)
+        # [2026-11-23, 신민용 요청: 수상 연도 "1줄에 4개씩"] 이 표는 내용이 다 들어가는 폭을 최소로 잡는다 — 창이 좁으면
+        # 여유가 많은 득점·도움 표(이름 칸이 늘었다 줄었다 함)가 대신 줄어든다.
+        _install_fit_columns(tbl, min_to_content=True)
+        row.addLayout(col, 1)
+        lay.addLayout(row, 1)
+        # [2026-11-24 신설, 신민용 요청] 아랫줄: 단일 시즌 최다 득점 | 단일 시즌 최다 도움(기록 년도 칸)
+        row2 = QHBoxLayout()
+        row2.setSpacing(12)
+        for key, title, vl in (("season_goals", "단일 시즌 최다 득점", "득점"), ("season_assists", "단일 시즌 최다 도움", "도움")):
+            col, tbl = self._make_record_rank_column(title)
+            self._fill_record_rank_table(tbl, season.get(key) or [], vl, True, "아직 기록이 없습니다", year_label="기록 년도")
+            row2.addLayout(col, 1)
+        lay.addLayout(row2, 1)
+        self._club_records_dialog = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _fill_club_poty_table(self, tbl, rows):
+        """구단 올해의 선수 다회 수상 표 — 순위 | 선수 | 국적 | 포지션(주포) | 횟수 | 수상 연도.
+        [2026-11-23] 득점·도움 표처럼 선수 줄 아래 이 클럽 소속 기간 줄.
+        [2026-11-24 변경] 기간(좌, 순위~횟수 칸) | 연수(우, 수상 연도 칸 오른쪽 끝). 두 줄은 한 묶음(같이 선택·같이 꺼짐, 어느 줄을 더블클릭해도 선수 상세)."""
+        cols = ["순위", "선수", "국적", "포지션", "횟수", "수상 연도"]
+        paired = any(r.get("period") for r in rows)
+        step = 2 if paired else 1
+        tbl.clear()
+        tbl.clearSpans()
+        tbl.setRowCount(len(rows) * step)
+        tbl.setColumnCount(len(cols))
+        tbl.setHorizontalHeaderLabels(cols)
+        hdr = tbl.horizontalHeader()
+        hdr.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        # [2026-11-23 변경, 신민용 요청: "1줄에 4개씩"] 칸은 모두 내용 맞춤(연도 칸 = 4개 한 줄 너비, 이름도 안 잘림) —
+        # 남는 폭·가로 스크롤은 _install_fit_columns(채운 뒤 _apply_years_wrap에서).
+        self._install_years_wrap(tbl, 5)
+        for i, r in enumerate(rows):
+            years = ", ".join(str(y) for y in r["years"])
+            vals = [str(r["rank"]), r["name"], r["nationality"], r.get("position") or "-", f"{r['wins']}회", years]
+            tip = f"{r['name']} — 은퇴" if r["retired"] else (f"{r['name']} — {r['team_name']}" if r.get("team_name") else r["name"])
+            ri = i * step
+            for j, v in enumerate(vals):
+                cell = QTableWidgetItem(v)
+                cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if j == 0:
+                    cell.setData(Qt.ItemDataRole.UserRole, r["player_id"])
+                if j == 1:
+                    cell.setToolTip(tip)
+                if j == 5:
+                    cell.setToolTip(f"구단 올해의 선수 수상: {years}")
+                    cell.setData(_YEARS_ROLE, list(r["years"]))
+                if r["player_id"] == wb.MY_PLAYER_ID:
+                    cell.setForeground(Qt.GlobalColor.green)
+                tbl.setItem(ri, j, cell)
+            if paired:
+                per = r.get("period") or "-"
+                yrs = f"{r['period_years']}년" if r.get("period_years") else ""
+                _c = QColor("#7fbf7f") if r["player_id"] == wb.MY_PLAYER_ID else QColor("#9a9a9a")
+                p_cell = QTableWidgetItem(per)
+                p_cell.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+                p_cell.setData(Qt.ItemDataRole.UserRole, r["player_id"])
+                # 합친 칸은 줄 높이 계산 때 첫 칸 폭으로만 재여서 긴 기간이 여러 줄로 잡혔다 — 한 줄 높이로 고정
+                p_cell.setData(Qt.ItemDataRole.SizeHintRole, QSize(1, tbl.fontMetrics().height() + 4))
+                p_cell.setForeground(_c)
+                p_cell.setToolTip(f"{r['name']} — 이 클럽 소속 기간(임대는 임대 간 팀, 시즌 중 이적한 해는 양쪽 팀): "
+                                  f"{per}" + (f" ({yrs})" if yrs else ""))
+                tbl.setItem(ri + 1, 0, p_cell)
+                for j in range(1, 5):
+                    tbl.setItem(ri + 1, j, QTableWidgetItem(""))
+                # [2026-11-24 변경, 신민용 요청] 득점·도움 표처럼 아래 줄 오른쪽 끝(수상 연도 칸)에 연수
+                y_cell = QTableWidgetItem(yrs)
+                y_cell.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight)
+                y_cell.setForeground(_c)
+                tbl.setItem(ri + 1, 5, y_cell)
+        self._show_empty_state(tbl, rows, f"아직 {wb.CLUB_POTY_MIN_WINS}회 이상 받은 선수가 없습니다", len(cols))
+        if paired:
+            for i in range(len(rows)):
+                tbl.setSpan(i * step + 1, 0, 1, 5)
+        tbl._paired_rows = paired
+        self._install_pair_selection(tbl)
+        self._apply_years_wrap(tbl, force=True)
+
+    # [2026-11-22 신설, 신민용 요청] 역대 개인상 → 기록 → "클럽 대항전": 대륙(콤보)·대회(챔피언스/유로파/컨퍼런스
+    # 토글 — 역대 클럽 대항전 탭과 같은 모양)를 고르면 그 대회 통산 최다 득점·도움 1~10위.
+    def _build_ia_club_comp_records_page(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        bar = QHBoxLayout()
+        bar.setSpacing(6)
+        _lbl_style = "color:#888;font-size:11px;"
+        cl = QLabel("대륙"); cl.setStyleSheet(_lbl_style)
+        bar.addWidget(cl)
+        combo = QComboBox()
+        combo.addItems(list(wb.CLUB_COMP_RECORD_CONTINENTS))
+        combo.setCurrentText(RANKING_FILTER_DEFAULT if RANKING_FILTER_DEFAULT in wb.CLUB_COMP_RECORD_CONTINENTS
+                             else wb.CLUB_COMP_RECORD_CONTINENTS[0])
+        combo.currentTextChanged.connect(lambda *_a: self._refresh_ia_club_comp_records())
+        bar.addWidget(combo)
+        self._ia_cc_cont_combo = combo
+        bar.addSpacing(10)
+        kl = QLabel("대회"); kl.setStyleSheet(_lbl_style)
+        bar.addWidget(kl)
+        _style = ("QPushButton{background:#2a2a2a;color:#888;border:1px solid #3a3a3a;"
+                  "border-radius:4px;padding:4px 10px;font-size:11px;}"
+                  "QPushButton:checked{background:#0d3d1a;color:#00cc44;border-color:#00cc44;}")
+        grp = QButtonGroup(page)
+        grp.setExclusive(True)
+        self._ia_cc_group = grp   # GC 방지용 참조 보관
+        self._ia_cc_comp = wb.CLUB_COMP_RECORD_KINDS[0][0]
+        for ckey, clabel in wb.CLUB_COMP_RECORD_KINDS:
+            b = QPushButton(clabel)
+            b.setCheckable(True)
+            b.setAutoDefault(False)
+            b.setDefault(False)
+            b.setStyleSheet(_style)
+            b.setChecked(ckey == self._ia_cc_comp)
+            b.clicked.connect(lambda _checked, k=ckey: self._on_ia_cc_comp_changed(k))
+            grp.addButton(b)
+            bar.addWidget(b)
+        bar.addStretch()
+        lay.addLayout(bar)
+        note = QLabel("그 대회 경기만(리그·국내컵·국가대표 제외) · 대회를 뛴 팀 기준(시즌 중 이적생은 이적 전 팀) · "
+                      "시즌 기록이 저장된 대회까지 · 1~10위(같은 기록은 같은 순위)")
+        note.setStyleSheet(_lbl_style)
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        row = QHBoxLayout()
+        row.setSpacing(12)
+        self._ia_cc_tables = {}
+        for key, title, vl in (("goals", "최다 득점", "득점"), ("assists", "최다 도움", "도움")):
+            col, tbl = self._make_record_rank_column(title)
+            row.addLayout(col, 1)
+            self._ia_cc_tables[key] = (tbl, vl, col.itemAt(0).widget(), title)
+        # [2026-11-23 신설, 신민용 요청] 그 대회 MVP 2회 이상 받은 선수 1~10위(같은 대륙·대회)
+        col, tbl = self._make_record_rank_column("MVP 다회 수상")
+        row.addLayout(col, 1)
+        self._ia_cc_mvp = (tbl, col.itemAt(0).widget())
+        lay.addLayout(row, 1)
+        return page
+
+    def _on_ia_cc_comp_changed(self, key):
+        if key == self._ia_cc_comp:
+            return
+        self._ia_cc_comp = key
+        self._refresh_ia_club_comp_records()
+
+    def _refresh_ia_club_comp_records(self):
+        """클럽 대항전 기록 두 표를 다시 채운다(버튼·대륙·대회를 바꿀 때, 기록 버튼을 눌렀는데 이 화면이 떠 있을 때)."""
+        if not hasattr(self, "_ia_cc_tables"):
+            return
+        cont, comp = self._ia_cc_cont_combo.currentText(), self._ia_cc_comp
+        clabel = dict(wb.CLUB_COMP_RECORD_KINDS).get(comp, "")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)   # 오프시즌 뒤 처음 열 때만 대회 기록 표를 훑는다
+        try:
+            data = wb.get_club_comp_player_records(cont, comp)
+            mvp = wb.get_club_comp_mvp_multi_winners(cont, comp)
+        finally:
+            QApplication.restoreOverrideCursor()
+        for key, (tbl, vl, title_lbl, title) in self._ia_cc_tables.items():
+            if title_lbl is not None:
+                title_lbl.setText(f"{cont} {clabel} {title}")
+            self._fill_record_rank_table(tbl, data.get(key) or [], vl, True, "아직 기록이 없습니다")
+        _mv = getattr(self, "_ia_cc_mvp", None)
+        if _mv is not None:
+            _mv[1].setText(f"{cont} {clabel} MVP 다회 수상 ({wb.AWARD_RECORD_MIN_WINS}회 이상)")
+            self._fill_ia_record_table(_mv[0], mvp, f"{cont} {clabel} MVP")
+
+    # 역대 개인상 → 기록 → "리그": 나라(기본 6개국 + 직접 입력)·부수를 고르면 그 리그 통산 최다 득점·도움.
+    def _build_ia_league_records_page(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        bar = QHBoxLayout()
+        bar.setSpacing(6)
+        _lbl_style = "color:#888;font-size:11px;"
+        cl = QLabel("국가"); cl.setStyleSheet(_lbl_style)
+        bar.addWidget(cl)
+        combo = QComboBox()
+        # [2026-11-23 변경, 신민용 요청: "리그 기록이 6개 리그만 뜬다 — 모든 국가 리그도"] 통산 장부(리그 범위)는
+        # 원래 모든 나라·부수를 담고 있어(record_ledger 'L' 범위) 드롭다운만 넓힌다 — 기본 6개국이 맨 앞, 그 아래
+        # 리그가 있는 나머지 나라(가나다순, 병역 리그 제외). 조회는 지금처럼 고른 나라·부수 하나만 읽는다.
+        self._ia_lg_all_countries = wb.get_league_record_countries()
+        combo.addItems(self._ia_lg_all_countries or list(wb.LEAGUE_RECORD_DEFAULT_COUNTRIES))
+        combo.setMaxVisibleItems(20)
+        combo.setEditable(True)
+        combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        # 입력하면 리그가 있는 모든 나라에서 부분일치 자동완성(선수 검색 국가 칸과 같은 방식)
+        completer = QCompleter(self._ia_lg_all_countries, combo)
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        combo.setCompleter(completer)
+        combo.setMinimumWidth(140)
+        combo.setStyleSheet(
+            "QComboBox::drop-down{border:none;width:20px;}"
+            "QComboBox::down-arrow{image:none;width:0;height:0;"
+            "border-left:4px solid transparent;border-right:4px solid transparent;"
+            "border-top:6px solid #4da6ff;margin-right:6px;}")
+        combo.lineEdit().returnPressed.connect(self._on_ia_lg_country_entered)
+        combo.activated.connect(lambda _i: self._on_ia_lg_country_entered())
+        completer.activated.connect(lambda t: self._on_ia_lg_country_entered(t))   # 고른 글자가 입력칸에 들어가기 전일 수 있어 직접 넘긴다
+        bar.addWidget(combo)
+        self._ia_lg_country_combo = combo
+        tl = QLabel("부수"); tl.setStyleSheet(_lbl_style)
+        bar.addSpacing(6)
+        bar.addWidget(tl)
+        tier_combo = QComboBox()
+        tier_combo.setMinimumWidth(200)
+        tier_combo.currentIndexChanged.connect(lambda _i: self._refresh_ia_league_records())
+        bar.addWidget(tier_combo)
+        self._ia_lg_tier_combo = tier_combo
+        self._ia_lg_msg = QLabel("")
+        self._ia_lg_msg.setStyleSheet("color:#ff8866;font-size:11px;")
+        bar.addWidget(self._ia_lg_msg)
+        bar.addStretch()
+        lay.addLayout(bar)
+        note = QLabel("그 시즌에 실제로 뛴 리그·부수 기준(강등·승격·이적해도 그 해 기록은 그 해 리그에) · 리그 경기만 · "
+                      "병역 리그 제외 · 시즌이 끝난 기록까지 · 1~10위(같은 기록은 같은 순위)")
+        note.setStyleSheet("color:#888;font-size:11px;")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        row = QHBoxLayout()
+        row.setSpacing(12)
+        self._ia_lg_tables = {}
+        for key, title, vl in (("goals", "리그 최다 득점", "득점"), ("assists", "리그 최다 도움", "도움")):
+            col, tbl = self._make_record_rank_column(title)
+            row.addLayout(col, 1)
+            self._ia_lg_tables[key] = (tbl, vl)
+        # [2026-11-23 신설, 신민용 요청] 리그 MVP 2회 이상 받은 선수 1~10위 — 같은 나라·부수(리그 MVP 기준)
+        col, tbl = self._make_record_rank_column(f"리그 MVP 다회 수상 ({wb.AWARD_RECORD_MIN_WINS}회 이상)")
+        row.addLayout(col, 1)
+        self._ia_lg_mvp_tbl = tbl
+        lay.addLayout(row, 1)
+        self._ia_lg_country = None
+        self._ia_lg_set_country(wb.LEAGUE_RECORD_DEFAULT_COUNTRIES[0], refresh=False)
+        return page
+
+    def _on_ia_lg_country_entered(self, text=None):
+        """입력한 나라 확정 — 정확히 같은 이름, 없으면 입력 글자를 포함하는 첫 나라(리그가 있는 나라만)."""
+        typed = ((text if isinstance(text, str) else None) or self._ia_lg_country_combo.currentText() or "").strip()
+        names = self._ia_lg_all_countries
+        pick = typed if typed in names else next((n for n in names if typed and typed.lower() in n.lower()), None)
+        self._ia_lg_set_country(pick or typed)
+
+    def _ia_lg_set_country(self, country, refresh=True):
+        combo = self._ia_lg_country_combo
+        combo.blockSignals(True)
+        i = combo.findText(country)
+        if i >= 0:
+            combo.setCurrentIndex(i)
+        combo.setEditText(country)
+        combo.blockSignals(False)
+        tiers = wb.get_league_record_tiers(country) if country in self._ia_lg_all_countries else []
+        tc = self._ia_lg_tier_combo
+        prev = tc.currentData()
+        tc.blockSignals(True)
+        tc.clear()
+        for t, lname in tiers:
+            tc.addItem(f"{t}부 ({lname})", t)
+        j = tc.findData(prev) if prev is not None else -1
+        tc.setCurrentIndex(j if j >= 0 else (0 if tiers else -1))
+        tc.blockSignals(False)
+        self._ia_lg_country = country if tiers else None
+        self._ia_lg_msg.setText("" if tiers else f"'{country}' — 리그 기록이 있는 국가가 아닙니다")
+        if refresh:
+            self._refresh_ia_league_records()
+
+    def _refresh_ia_league_records(self):
+        """리그 기록 두 표를 다시 채운다(리그 버튼·나라·부수를 바꿀 때, 기록 버튼을 눌렀는데 리그 화면이 떠 있을 때)."""
+        if not hasattr(self, "_ia_lg_tables"):
+            return
+        country, tier = self._ia_lg_country, self._ia_lg_tier_combo.currentData()
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)   # 나라를 처음 열 때만 시즌 기록 표를 훑는다
+        try:
+            data = wb.get_league_player_records(country, tier) if (country and tier is not None) else {}
+            mvp = wb.get_league_mvp_multi_winners(country, tier) if (country and tier is not None) else []
+        finally:
+            QApplication.restoreOverrideCursor()
+        for key, (tbl, vl) in self._ia_lg_tables.items():
+            self._fill_record_rank_table(tbl, data.get(key) or [], vl, True,
+                                         "아직 기록이 없습니다" if country else "국가를 입력하세요")
+        if getattr(self, "_ia_lg_mvp_tbl", None) is not None:
+            self._fill_ia_record_table(self._ia_lg_mvp_tbl, mvp, "리그 MVP")
 
     # [2026-09 신설, 신민용 확정: "국제대회 클럽 대항전도 그렇고 다 필터가
     # 있어야 해 대회명별로 상별로 뜨게" / "리그는 구현이 제대로 안 됨"]
@@ -14968,6 +16014,10 @@ class WorldBrowserWindow(QDialog):
         for prefix in getattr(self, "_ia_filter_specs", {}):
             if self._ia_filterable_current_year(prefix) is not None:
                 self._reload_ia_filterable_table(prefix)
+        # [2026-11-22] 기록 화면이 떠 있으면 이름 변경도 바로 반영
+        if getattr(self, "_ia_rec_stack", None) is not None and self._ia_cat_buttons.get("records") is not None \
+                and self._ia_cat_buttons["records"].isChecked():
+            self._refresh_ia_records()
         if getattr(self, "ia_league_year_list", None) is not None:
             self._refresh_ia_league_table_if_selected()
         if getattr(self, "ia_cup_year_list", None) is not None:

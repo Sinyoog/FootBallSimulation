@@ -16,6 +16,7 @@ intl_engine.py ─ 국제대회(월드컵/대륙컵) 엔진
 """
 
 import random
+import virtual_youth as _VY   # [2026-11-22 1단계] 가상 유스 공통 판정
 import math
 
 from database import get_conn
@@ -898,13 +899,8 @@ def choose_national_team(tournament_id, nat):
 
     selected = _check_selection(p, grade, country=nat, continent=nat_continent,
                                 tournament_id=tournament_id)
-    # [2026-11-16 신민용 확정 — 국대 측면 2:2 고정] 이미 확정된 명단의 내 측면 칸 AI가 모두 이 대회에서 뛰었으면
-    # 자리를 비울 수 없어 발탁하지 않는다.
-    if selected and not intl_my_join_ok(tournament_id, nat, p.get("position")):
-        selected = False
-        from game_engine import add_log as _add_log_side
-        _add_log_side(f"⚠ {nat} 대표팀 명단이 이미 확정돼 있고 {p.get('position')} 자리 선수가 모두 이 대회에 출전해, "
-                      f"자리를 비울 수 없어 발탁되지 않았습니다.", "event")
+    # [2026-11-21 신민용 확정 ①(가)] 예전 "내 측면 칸 AI가 모두 뛰었으면 발탁하지 않음"(2:2 고정 시절) 규칙은 없앴다 —
+    # 측면 상한이 없어져 다른 칸·비측면 선수를 빼도 측면 규칙이 깨지지 않는다(intl_my_join_drops 참고).
     if not selected and p.get("injured") and _tournament_injury_eval(
             tournament_id, nat, _my_injury_return_day(p))[0] == "exclude":
         from game_engine import add_log as _add_log_inj
@@ -1432,6 +1428,53 @@ def get_my_match(week, day=None, p=None, st=None):
     }
 
 
+def _in_ko_bracket(conn, tid, country):
+    """그 나라가 이 대회 KO 대진(stage!='group') 어딘가에 이미 배정돼 있는가.
+    조별리그 종료 때 첫 KO 라운드는 진출국으로 전부 채워지므로(_fill_ko_shell),
+    status='ko'인데 여기 없으면 조별리그에서 탈락한 나라다."""
+    return conn.execute(
+        """SELECT 1 FROM intl_matches WHERE tournament_id=? AND stage!='group'
+           AND (home=? OR away=?) LIMIT 1""",
+        (tid, country, country)).fetchone() is not None
+
+
+def _repair_unadvanced_group_teams(t):
+    """[2026-11 신설 — 기존 세이브 보정] 예전 _finalize_groups는 3위 구제가 없는
+    형식(n_best == 0: 랭킹 평가전·64개국 월드컵·best_thirds=0 지역컵)에서 조 3위를
+    탈락 처리하지 않았다(alive=1 잔존, 내 국가면 성적 기록 누락). 이미 KO로 넘어간
+    대회에서 'KO 대진에 없는데 alive=1'인 나라를 찾아 alive=0으로 고치고, 그게
+    내 국가이고 아직 성적이 없으면 원래 그때 됐어야 할 "조별리그 탈락"을 기록한다.
+    조별리그 경기가 있는 대회만 대상(조 없이 바로 KO인 소규모 지역컵 제외). 멱등 —
+    고칠 게 없으면 SELECT 한 번으로 끝난다."""
+    if t.get("status") != "ko":
+        return
+    tid = t["id"]
+    conn = get_conn()
+    stale = [r["country"] for r in conn.execute(
+        """SELECT e.country FROM intl_entries e
+           WHERE e.tournament_id=? AND e.alive=1
+             AND EXISTS (SELECT 1 FROM intl_matches g
+                         WHERE g.tournament_id=e.tournament_id AND g.stage='group')
+             AND NOT EXISTS (SELECT 1 FROM intl_matches m
+                             WHERE m.tournament_id=e.tournament_id AND m.stage!='group'
+                               AND (m.home=e.country OR m.away=e.country))""",
+        (tid,)).fetchall()]
+    if not stale:
+        conn.close()
+        return
+    conn.executemany("UPDATE intl_entries SET alive=0 WHERE tournament_id=? AND country=?",
+                     [(tid, c_) for c_ in stale])
+    conn.commit()
+    my_result = conn.execute(
+        "SELECT my_result FROM intl_tournaments WHERE id=?", (tid,)).fetchone()
+    conn.close()
+    from game_engine import get_player
+    p = get_player()
+    nat = _my_nat(t, p) if p else ""
+    if nat and nat in stale and not ((my_result and my_result["my_result"]) or ""):
+        _record_my_exit(t, "조별리그 탈락")
+
+
 def get_my_pending_stage(week, day=None, p=None, st=None):
     """[2026-07 신설, 신민용 요청: "8강 날짜가 되면 이기기 전까지는 미정
     이렇게 메인 화면에 떠야 한다"] get_my_match는 내 국가가 실제로 배정된
@@ -1463,6 +1506,13 @@ def get_my_pending_stage(week, day=None, p=None, st=None):
         "SELECT alive FROM intl_entries WHERE tournament_id=? AND country=?",
         (t["id"], nat)).fetchone()
     if alive_row and alive_row["alive"] == 0:
+        conn.close()
+        return None
+    # [2026-11 버그수정] 조별리그가 끝났는데(status='ko') 내 국가가 KO 대진
+    # 어디에도 없으면 = 조별리그 탈락. 예전 _finalize_groups 버그로 alive=1이
+    # 남아 있는 세이브에서도 "4강 (미정)"이 뜨지 않게 한 번 더 막는다
+    # (_repair_unadvanced_group_teams가 다음 진행 때 alive도 바로잡는다).
+    if t["status"] == "ko" and not _in_ko_bracket(conn, t["id"], nat):
         conn.close()
         return None
     m = conn.execute(
@@ -3053,9 +3103,8 @@ def _intl_candidate_metrics(candidates, year=None):
                 ph = ",".join("?" * len(chunk))
                 for r in conn.execute(
                         f"""SELECT t.id, t.current_tier AS tier, cn.name AS cname
-                            FROM teams t JOIN leagues l ON t.league_id=l.id
-                            JOIN countries cn ON l.country_id=cn.id
-                            WHERE t.id IN ({ph})""", chunk):
+                            FROM teams t {_VY.nt_join(conn)}
+                            WHERE t.id IN ({ph})""", chunk):   # [2026-11-22 1단계] 가상 유스 팀 = 가상 리그 수준
                     team_league[r["id"]] = (r["cname"], r["tier"] or 1)
     except Exception as _e:
         print(f"[INTL] 선발 지표 조회 실패(OVR 기준으로 진행): {_e}")
@@ -3314,6 +3363,168 @@ def _v4_build(country, size, me=None, tournament_id=None):
     return _v4.build_squad(cands, size, style=_v4_style(country, tournament_id), force_ids=force)
 
 
+# ── [2026-11-20 신설, 신민용 확정 — v4 26인 측면 보정(A안)] ─────────────────────────────────────────
+# v4 선발(intl_squad_v4.build_squad)에는 좌우 개념이 없어 나라마다 한쪽 측면이 비었다(1시즌 기준선: 윙 양쪽
+# 2명+ 63%, 풀백 59%). 예전 정원 방식의 측면 2:2(_intl_rebuild_side_groups)는 v4가 켜져 있으면 실행되지 않는다.
+# 규칙(신민용 확정):
+#   · 측면 칸 = 윙 좌{LW,LM}/우{RW,RM}, 풀백 좌{LB,LWB}/우{RB,RWB}. 선수 한 명 = 한 칸 — 주포가 측면이면 주포 쪽,
+#     아니면 부포가 측면이면 부포 쪽(주포·부포가 다른 쪽이면 주포). 둘 다 아니면 측면 선수가 아니다.
+#   · 각 칸 필요 인원 = 대회 포메이션의 그 쪽 칸 수 + 1, 최소 V4_SIDE_MIN(2)명(3-4-3 윙 좌 LM·LW = 3).
+#     [2026-11-20 보완] 그 쪽 칸이 있으면 같은 쪽 후보(대회 주전 아닌 측면 선수) ≥ 1. 대회 주전은 빼지 않는다.
+#     보정 뒤 대회 포메이션·주전 재계산 → 조건이 깨지면 다시 보정(최대 3회), 안정 안 되면 unstable 기록.
+#     상한 없음(3:2 그대로) — 부족한 칸이 있을 때만 바꾼다.
+#   · 잠금: v4 빌드 XI 11명 · GK 전원(3명) · 이미 발탁된 내 선수. v4 칸별 백업은 잠그지 않는다.
+#   · 넣을 선수: 26명 밖 같은 쪽 전문 선수(위 규칙으로 그 칸인 선수)만 — 배치 점수(선발 점수 × 엔진 자리 배율,
+#     _intl_side_place) 최고. 대체 포지션(CB·ST 등)은 쓰지 않는다.
+#   · 뺄 선수: ① 같은 그룹 반대쪽이 3명+면 그쪽 최저 선발 점수 → ② 다른 그룹에서 3명+인 칸의 최저 →
+#     ③ 비측면 최저. 어떤 칸도 2명 미만으로 만들지 않는다.
+#   · 미충족(억지로 채우지 않음): "no_candidate" = 26명 밖에 그 칸 전문 선수 없음 / "no_safe_swap" = 후보는
+#     있지만 잠금·다른 칸 최소 인원 때문에 뺄 선수가 없음(설계 예외인지 검토용으로 따로 남긴다).
+# [2026-11-21 채택, 신민용 확정] 10시즌 검증(2시드·20시즌 필수 기준 전부 통과) 후 상시 적용 — 스위치 없음.
+#   명단 생성 때 보정(아래 _v4_side_balance) + 대회 첫 경기 주전 확정 직전 마지막 확인(_v4_first_match_side_fix).
+#   올림픽(U-23)은 자기 경로라 대상 아님.
+V4_SIDE_MIN = 2
+V4_SIDE_CARDS = (("WG", "L"), ("WG", "R"), ("FB", "L"), ("FB", "R"))
+_V4_SIDE_OF_POS = {"LW": ("WG", "L"), "LM": ("WG", "L"), "RW": ("WG", "R"), "RM": ("WG", "R"),
+                   "LB": ("FB", "L"), "LWB": ("FB", "L"), "RB": ("FB", "R"), "RWB": ("FB", "R")}
+_V4_SIDE_SLOT = {("WG", "L"): "LW", ("WG", "R"): "RW", ("FB", "L"): "LB", ("FB", "R"): "RB"}
+
+
+def v4_side_card(c):
+    """선수 dict → 측면 칸 (그룹, 쪽) 또는 None. 주포 우선, 주포가 측면이 아니면 부포."""
+    k = _V4_SIDE_OF_POS.get(c.get("position") or "")
+    if k is not None:
+        return k
+    return _V4_SIDE_OF_POS.get(c.get("sub_pos") or "")
+
+
+V4_SIDE_MAX_ROUNDS = 3   # [2026-11-20 보완] 포메이션 재계산 최대 횟수
+
+
+def v4_side_needs(formation):
+    """칸별 필요 인원 = max(V4_SIDE_MIN, 그 포메이션에서 그 쪽 칸 수 + 1). 예: 3-4-3 윙 좌(LM·LW)=3."""
+    from constants import FORMATION_SLOTS
+    slots = FORMATION_SLOTS.get(formation) or []
+    n = {k: 0 for k in V4_SIDE_CARDS}
+    for sl in slots:
+        k = _V4_SIDE_OF_POS.get(sl)
+        if k is not None:
+            n[k] += 1
+    return {k: max(V4_SIDE_MIN, n[k] + 1) for k in V4_SIDE_CARDS}
+
+
+def _v4_side_has_slot(formation):
+    """칸별로 그 포메이션에 그 쪽 측면 칸이 있는가."""
+    from constants import FORMATION_SLOTS
+    out = {k: False for k in V4_SIDE_CARDS}
+    for sl in FORMATION_SLOTS.get(formation) or []:
+        k = _V4_SIDE_OF_POS.get(sl)
+        if k is not None:
+            out[k] = True
+    return out
+
+
+def _v4_side_short(squad, starters, need, has_slot, skip=()):
+    """조건 미달 칸 목록 [(칸, 인원, 후보 수)] — 인원 < need, 또는 그 쪽 칸이 있는데 같은 쪽 비주전(후보) 0명."""
+    import collections as _co
+    cnt = _co.Counter(v4_side_card(c) for c in squad)
+    bench = _co.Counter(v4_side_card(c) for c in squad if c["id"] not in starters)
+    return [(k, cnt[k], bench[k]) for k in V4_SIDE_CARDS
+            if k not in skip and (cnt[k] < need[k] or (has_slot[k] and bench[k] < 1))], cnt, bench
+
+
+def _v4_side_pass(squad, outside, locked, need, has_slot, starters):
+    """보정 1회(포메이션·주전 고정). squad·outside를 직접 바꾼다. 반환 (swaps, unmet).
+    넣은 선수는 이번 회차에선 후보로 친다(주전은 다음 회차 재계산에서 확인)."""
+    swaps, unmet = [], {}
+    starters = set(starters)
+    lock = set(locked) | starters          # 실제 대회 주전도 이 회차에서는 빼지 않는다
+    while True:
+        short, cnt, bench = _v4_side_short(squad, starters, need, has_slot, skip=unmet)
+        if not short:
+            break
+        k = min(short, key=lambda t: (t[1] - need[t[0]], t[2], V4_SIDE_CARDS.index(t[0])))[0]
+        pool = [c for c in outside if v4_side_card(c) == k]
+        if not pool:
+            unmet[k] = {"reason": "no_candidate", "have": cnt[k], "bench": bench[k], "need": need[k]}
+            continue
+        slot = _V4_SIDE_SLOT[k]
+        add = max(pool, key=lambda c: (_intl_side_place(c, slot, float(c.get("_score") or 0.0))[0], -c["id"]))
+
+        def surplus(x):        # 빼도 그 칸 조건(인원·후보)이 유지되는가
+            return cnt[x] > need[x] and (not has_slot[x] or bench[x] > 1)
+        opp = (k[0], "R" if k[1] == "L" else "L")
+        free = [c for c in squad if c["id"] not in lock]
+        tiers = (
+            [c for c in free if v4_side_card(c) == opp and surplus(opp)],
+            [c for c in free if v4_side_card(c) is not None and v4_side_card(c)[0] != k[0]
+             and surplus(v4_side_card(c))],
+            [c for c in free if v4_side_card(c) is None],
+        )
+        drop, tier = None, None
+        for ti, lst in enumerate(tiers, 1):
+            if lst:
+                drop, tier = min(lst, key=lambda c: (float(c.get("_score") or 0.0), c["id"])), ti
+                break
+        if drop is None:
+            unmet[k] = {"reason": "no_safe_swap", "have": cnt[k], "bench": bench[k], "need": need[k],
+                        "candidates": len(pool), "locked_in_squad": sum(1 for c in squad if c["id"] in lock),
+                        "side_counts": {f"{a}{b}": cnt[(a, b)] for a, b in V4_SIDE_CARDS}}
+            continue
+        squad.remove(drop)
+        squad.append(add)
+        outside.remove(add)
+        outside.append(drop)
+        swaps.append({"card": f"{k[0]}{k[1]}", "need": need[k], "in": add["id"], "in_pos": add.get("position"),
+                      "in_sub": add.get("sub_pos"), "in_score": float(add.get("_score") or 0.0),
+                      "out": drop["id"], "out_pos": drop.get("position"),
+                      "out_score": float(drop.get("_score") or 0.0), "out_tier": tier})
+    return swaps, unmet
+
+
+def _v4_side_balance(res, cands, lock_ids=(), country=None, path="", style=None, formation_fn=None):
+    """v4 build_squad 결과(res)의 26인을 측면 규칙(위 주석)으로 보정한 새 결과 dict — xi·backups는 그대로,
+    squad만 바뀐다(인원 수 동일). cands = 그 빌드에 넣은 후보 전체(내 선수 포함 가능). 난수 미사용.
+    [2026-11-20 보완, 신민용 승인] 대회 포메이션·주전(이 26명으로 게임과 같은 intl_squad_v4.choose_formation) 기준:
+    ① 칸별 인원 ≥ max(2, 그 쪽 칸 수 + 1), ② 그 쪽 칸이 있으면 같은 쪽 비주전(후보) ≥ 1. 실제 대회 주전은 그
+    회차에서 빼지 않는다. 보정 뒤 포메이션·주전을 다시 계산해 조건이 깨지면 다시 보정(최대 V4_SIDE_MAX_ROUNDS회).
+    그 안에 안정되지 않으면 "unstable"(합격 처리 안 함).
+    formation_fn(squad) → (포메이션, 주전 id 집합) — 테스트용 주입, 기본 = choose_formation(squad, style)."""
+    if formation_fn is None:
+        import intl_squad_v4 as _v4m
+
+        def formation_fn(sq):
+            f_, _xb, asg = _v4m.choose_formation(sq, style)
+            return f_, {c["id"] for _s, c in asg if c is not None}
+    squad = list(res.get("squad") or [])
+    xi_ids = {c["id"] for _s, c in (res.get("xi") or []) if c is not None}
+    locked = xi_ids | {c["id"] for c in squad if (c.get("position") or "") == "GK"} | set(lock_ids or ())
+    in_ids = {c["id"] for c in squad}
+    outside = [c for c in cands if c["id"] not in in_ids and (c.get("position") or "") != "GK"]
+    swaps, unmet, stable = [], {}, False
+    f, st = formation_fn(squad)
+    for _r in range(V4_SIDE_MAX_ROUNDS):
+        need, has = v4_side_needs(f), _v4_side_has_slot(f)
+        sw, unmet = _v4_side_pass(squad, outside, locked, need, has, st)
+        swaps += sw
+        f2, st2 = formation_fn(squad) if sw else (f, st)
+        left = _v4_side_short(squad, st2, v4_side_needs(f2), _v4_side_has_slot(f2), skip=unmet)[0]
+        f, st = f2, st2
+        if not left:            # 다시 계산한 포메이션·주전 기준으로도 조건 충족(미충족 칸 제외) → 안정
+            stable = True
+            break
+    final_need = v4_side_needs(f)
+    out = dict(res)
+    out["squad"] = squad
+    out["side_swaps"] = swaps
+    out["side_unmet"] = unmet
+    out["side_stable"] = stable
+    out["side_formation"] = f
+    out["side_starters"] = st
+    out["side_need"] = final_need
+    return out
+
+
 def _v4_squad_for_group_builder(country, quota_by_group, candidates_out):
     """_build_intl_squad_by_group의 v4 경로 — AI 명단(dict 목록)을 돌려준다. 정원 합계가 26보다 작으면(내가
     발탁돼 한 자리를 비운 경우) 나를 넣어 26명을 짠 뒤 나를 뺀다(나와 AI가 한 기준으로 경쟁)."""
@@ -3328,6 +3539,10 @@ def _v4_squad_for_group_builder(country, quota_by_group, candidates_out):
         except Exception:
             me = None
     res = _v4_build(country, total + (1 if me is not None else 0), me=me)
+    # [2026-11-21 채택] 측면 보정 — 내 선수 발탁 판정과 같은 함수
+    res = _v4_side_balance(res, list(_v4_candidates(country)) + ([me] if me is not None else []),
+                           lock_ids=((me["id"],) if me is not None else ()), country=country, path="ai",
+                           style=_v4_style(country))
     picked = [c for c in res["squad"] if c["id"] != -1][:total]
     if candidates_out is not None:
         used = {c["id"] for c in picked}
@@ -3867,47 +4082,74 @@ def intl_inherit_trim(picked, side_cards, my_pos, target):
     return [r for r in picked if r["id"] not in drop], drop
 
 
-def intl_my_join_drops(result, side_cards, my_pos, target):
-    """이미 확정된 이 대회 명단에 내가 나중에 발탁될 때 뺄 AI(아직 이 대회에서 안 뛴 선수만, OVR 최하위부터).
-    ① 내 자리가 측면 칸이면 그 칸 AI가 1명 남을 때까지 그 칸에서 뺀다(총원과 무관 — 좌우 칸 정원 우선).
-    ② 그래도 target명보다 많으면 측면 칸이 아닌 AI에서 뺀다(측면 칸은 건드리지 않는다).
-    반환 (뺄 선수 id 목록, 내 칸 정원을 맞출 수 있는가)."""
-    keyf = lambda r: ((r["ovr"] or 0), -(r["age"] or 0))
-    rs = sorted(result, key=keyf)
+def intl_my_join_drops(result, my_pos, target, my_sub=None):
+    """이미 만들어진 이 대회 명단에 내가 나중에 발탁될 때 뺄 AI id 목록 — 명단이 target명(내 자리 1칸을 뺀 인원)이
+    될 만큼만 뺀다(보통 1명: AI 26 → 25 + 나 = 26). 이미 이 대회에서 뛴 선수는 빼지 않는다. 순서는 예전과 같이
+    (OVR, −나이) 오름차순.
+    [2026-11-21 신민용 확정 ①(가)] 예전 "측면 각 2칸 고정(2:2)" 시절 규칙(내 칸 AI를 1명 남을 때까지 총원과 무관하게
+    뺌 → AI 24명이 되던 문제, 내 칸 AI가 모두 뛰었으면 발탁 거절)을 채택된 측면 규칙(최소 2명·상한 없음)에 맞춘다.
+      · 측면 분류는 채택 규칙과 같다(v4_side_card — 주포 우선, 아니면 부포, LM·RM·LWB·RWB 포함).
+      · 내가 GK면 GK 최저(AI GK 3 → 2 + 나 = 3).
+      · 내 자리가 측면 칸이고 그 칸 AI가 2명 이상이면 그 칸 최저(AI 1명 이상 + 나 ≥ 2).
+      · 아니면 비측면(GK 제외) 최저. 그것도 없으면 최소 인원(2)을 넘는 다른 측면 칸 최저.
+    주전이 이미 정해진 대회라면 호출부가 뺀 뒤 측면 확인(intl_side_recheck_after_join)을 다시 한다."""
+    from collections import Counter
+    rows = sorted([dict(r) for r in result], key=lambda r: ((r.get("ovr") or 0), -(r.get("age") or 0)))
+    try:
+        import sub_positions as _sp
+        _sp.attach(rows)
+    except Exception:
+        pass
+    n = max(0, len(rows) - target)
+    if not n:
+        return []
+    card = {r["id"]: v4_side_card(r) for r in rows}
+    cnt = Counter(card.values())
+    free = [r for r in rows if not r.get("appearances")]
+    my_card = v4_side_card({"position": my_pos or "", "sub_pos": my_sub}) if my_pos != "GK" else None
     drop = []
-    if my_pos in INTL_SIDE_BUCKETS:
-        holders = [r for r in rs if side_cards.get(r["id"]) == my_pos]
-        need = len(holders) - (INTL_SIDE_PER_SLOT - 1)
-        free = [r for r in holders if not r.get("appearances")]
-        if need > len(free):
-            return [], False        # 발탁 자체를 하지 않는 경우(intl_my_join_ok) — 아무도 빼지 않는다
-        drop += [r["id"] for r in free[:max(0, need)]]
-    rest = [r for r in rs if r["id"] not in side_cards and not r.get("appearances")]
-    while len(rs) - len(drop) > target and rest:
-        drop.append(rest.pop(0)["id"])
-    return drop, True
+
+    def _take(pred):
+        for r in free:
+            if len(drop) >= n:
+                return
+            if r["id"] not in drop and pred(r):
+                drop.append(r["id"])
+                cnt[card[r["id"]]] -= 1
+
+    if my_pos == "GK":
+        _take(lambda r: (r.get("position") or "") == "GK")
+    elif my_card is not None:
+        _take(lambda r: card[r["id"]] == my_card and cnt[my_card] >= 2)
+    _take(lambda r: card[r["id"]] is None and (r.get("position") or "") != "GK")
+    _take(lambda r: card[r["id"]] is not None and card[r["id"]] != my_card and cnt[card[r["id"]]] > V4_SIDE_MIN)
+    return drop
 
 
-def intl_my_join_ok(tournament_id, country, my_pos):
-    """[2026-11-16 신민용 확정] 이 대회 명단이 이미 확정돼 있고 내 자리가 측면 칸인데, 그 칸 AI가 모두 이미 이 대회에서
-    뛰어 자리를 비울 수 없으면 발탁하지 않는다(False) — 출전 기록이 있는 선수를 빼지 않고, 다른 칸·비측면 선수를 빼서
-    좌우 칸 정원을 깨지도 않는다. 명단이 아직 없거나 측면 칸이 아니면 True."""
-    if my_pos not in INTL_SIDE_BUCKETS:
-        return True
+def intl_side_recheck_after_join(tournament_id, country, pool):
+    """[2026-11-21 신민용 확정 ①(가)] 주전이 이미 정해진 대회에 내가 들어와 AI를 뺀 뒤 — 저장된 대회 포메이션·주전
+    기준으로 첫 경기 보정(_v4_first_match_side_fix)을 한 번 더 돌린다(같은 규칙·같은 잠금, 출전 선수 보호).
+    주전이 빠졌으면 _pick_intl_starters가 주전을 다시 정하면서 보정하므로 여기서는 하지 않는다.
+    반환: 명단이 바뀌었는가(호출부는 다시 읽는다)."""
+    if not _v4_on():
+        return False
+    st = [r["id"] for r in pool if r.get("starter")]
+    if not st or len(st) < min(11, len(pool)):
+        return False
+    from database import get_conn
     conn = get_conn()
     try:
-        rows = conn.execute(
-            "SELECT s.player_id AS id, s.appearances, ap.position, ap.ovr, ap.age FROM intl_squad s "
-            "JOIN ai_players ap ON ap.id = s.player_id WHERE s.tournament_id=? AND s.country=?",
-            (tournament_id, country)).fetchall()
-        if not rows:
-            return True
-        result = [dict(r) for r in rows]
-        sc = intl_inherit_side_cards(conn, tournament_id, country, result)
+        row = conn.execute("SELECT formation FROM intl_formations WHERE tournament_id=? AND country=?",
+                           (tournament_id, country)).fetchone()
     finally:
         conn.close()
-    from constants import INTL_SQUAD_TOTAL
-    return intl_my_join_drops(result, sc, my_pos, INTL_SQUAD_TOTAL - 1)[1]
+    from constants import FORMATION_SLOTS
+    formation = row[0] if row else None
+    if formation not in FORMATION_SLOTS:
+        return False
+    r = _v4_first_match_side_fix(tournament_id, country, formation,
+                                 _v4_pool_with_scores(tournament_id, country, pool), st)
+    return bool(r["swaps"])
 
 
 def intl_inherit_vacancies(picked, side_cards, my_pos):
@@ -4546,8 +4788,12 @@ def _check_selection(p, my_grade, country="", continent="", tournament_id=None):
             return False
         import intl_squad_v4 as _v4
         from constants import INTL_SQUAD_TOTAL
-        _res = _v4.build_squad(list(_v4_candidates(nat)) + [_me], INTL_SQUAD_TOTAL,
+        _cands_me = list(_v4_candidates(nat)) + [_me]
+        _res = _v4.build_squad(_cands_me, INTL_SQUAD_TOTAL,
                                style=_v4_style(nat, tournament_id))
+        # [2026-11-21 채택] AI 26인과 같은 측면 보정(나도 일반 후보로 경쟁)
+        _res = _v4_side_balance(_res, _cands_me, country=nat, path="my_check",
+                                style=_v4_style(nat, tournament_id))
         return any(c["id"] == -1 for c in _res["squad"])
 
     quota = INTL_SQUAD_GROUP_QUOTA.get(my_grp, 4)
@@ -5854,6 +6100,8 @@ def _process_one_tournament_week(t, week, day=None):
         conn_s.close()
         return
 
+    _repair_unadvanced_group_teams(t)   # [2026-11] 예전 세이브의 조 3위 alive 잔존 보정
+
     # [2026-07 재설계, KO 셸 사전생성에 맞춰 재작성] 예전엔 "stage!='group'
     # 인 미완료 행이 하나라도 있으면 이번 주차엔 할 게 없다"고 판단했는데,
     # 이제 R16~결승/3-4위전 전 스테이지가 대회 시작 시점에 이미
@@ -6438,6 +6686,68 @@ def _intl_manager_style(conn, tournament_id, country):
         return mid, None
 
 
+def _v4_first_match_side_fix(tournament_id, country, formation, scored_pool, starter_ids):
+    """[2026-11-21 마지막 재시도, 신민용 승인] 대회 포메이션·주전이 실제로 정해지는 순간(_pick_intl_starters가
+    주전을 저장하기 직전)에 측면 규칙을 한 번 더 확인하고, 깨져 있으면 후보만 바꾼다. 명단 생성 때 보정(A안)은
+    그대로 두고, 이 단계가 마지막 확인이다. 승계 명단·대회 중 주전 재선정도 모두 이 자리를 지난다.
+    규칙은 A안과 같다(_v4_side_pass: 같은 쪽 전문 선수만, 빼는 3단계, 미충족은 사유와 함께 기록).
+      잠금: 이번 주전 11명 · GK 전원 · 이 대회에 이미 출전한 선수 · 내 선수(id -1).
+      포메이션은 이미 저장돼 있고 주전은 잠겨 있으므로 다시 계산하지 않는다(한 번만 확인).
+    DB: 빠진 선수 intl_squad 행 삭제(출전 0만), 들어온 선수 행 추가(출전 0, 포지션 스냅샷). 후보군
+    (intl_callup_pool)은 뽑힌 선수도 담는 표라 그대로 두면 빠진 선수가 "후보탈락"으로 보인다. 후보 라인
+    (intl_callup_role_pool)은 행이 있을 때만 뽑힘 표시를 맞춘다. 난수 미사용.
+    반환: {"swaps": 교체 목록, "unmet": 미충족 칸 {칸: 사유}, "stable": 남은 부족 없음}."""
+    squad = [dict(c) for c in scored_pool]
+    apps = {c["id"]: int(c.get("appearances") or 0) for c in squad}
+    starter_ids = set(starter_ids)
+    locked = (starter_ids | {c["id"] for c in squad if (c.get("position") or "") == "GK"}
+              | {i for i, n in apps.items() if n > 0} | {-1})
+    in_ids = {c["id"] for c in squad}
+    outside = [dict(c) for c in _v4_candidates(country)
+               if c["id"] not in in_ids and (c.get("position") or "") != "GK" and v4_side_card(c) is not None]
+    from database import get_conn
+    conn = get_conn()
+    try:
+        if outside:
+            _ph = ",".join("?" * len(outside))
+            _ok = {r[0] for r in conn.execute(
+                f"SELECT ap.id FROM ai_players ap JOIN teams t ON ap.team_id=t.id WHERE ap.id IN ({_ph})",
+                [c["id"] for c in outside])}
+            outside = [c for c in outside if c["id"] in _ok]
+        need, has = v4_side_needs(formation), _v4_side_has_slot(formation)
+        swaps, unmet = _v4_side_pass(squad, outside, locked, need, has, starter_ids)
+        left = _v4_side_short(squad, starter_ids, need, has, skip=unmet)[0]
+        if swaps:
+            _rows = {c["id"]: c for c in squad}
+            conn.executemany(
+                "DELETE FROM intl_squad WHERE tournament_id=? AND country=? AND player_id=? AND appearances=0",
+                [(tournament_id, country, sw["out"]) for sw in swaps])
+            conn.executemany(
+                "INSERT OR IGNORE INTO intl_squad(tournament_id, country, player_id, appearances, position) "
+                "VALUES (?,?,?,0,?)",
+                [(tournament_id, country, sw["in"], _rows[sw["in"]].get("position") or "") for sw in swaps])
+            try:
+                if conn.execute("SELECT 1 FROM intl_callup_role_pool WHERE tournament_id=? AND country=? LIMIT 1",
+                                (tournament_id, country)).fetchone():
+                    conn.executemany(
+                        "UPDATE intl_callup_role_pool SET picked=0 WHERE tournament_id=? AND country=? AND player_id=?",
+                        [(tournament_id, country, sw["out"]) for sw in swaps])
+                    conn.executemany(
+                        "INSERT INTO intl_callup_role_pool(tournament_id, country, grp, quota, rank, player_id, "
+                        "score, position, fit, picked, via, card) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+                        "ON CONFLICT(tournament_id, country, grp, player_id) DO UPDATE SET picked=1, "
+                        "via=excluded.via, card=excluded.card, quota=excluded.quota",
+                        [(tournament_id, country, sw["card"][:2], V4_SIDE_MIN, 99, sw["in"],
+                          round(float(sw["in_score"]), 2), sw.get("in_pos") or "", None, 1, "side_fix",
+                          _V4_SIDE_SLOT[(sw["card"][:2], sw["card"][2:])]) for sw in swaps])
+            except Exception:
+                pass
+            conn.commit()
+    finally:
+        conn.close()
+    return {"swaps": swaps, "unmet": unmet, "stable": not left}
+
+
 def _pick_intl_starters(tournament_id, country, avg_ovr):
     """이번 경기에 실제로 뛰는 11명을 이 대회 동안 고정된 26인 풀
     (database.get_or_create_intl_squad)에서 골라낸다. 대회에서 이 나라가
@@ -6502,7 +6812,8 @@ def _pick_intl_starters(tournament_id, country, avg_ovr):
         # [2026-11 v4] 주전 = 선발 점수 × 자리 적합도 최적 배정(OVR−나이 대신). AI 26인 풀 기준(내 선수 기용은
         # 경기 쪽 기존 규칙 그대로).
         import intl_squad_v4 as _v4
-        _sp = [c for c in _v4_pool_with_scores(tournament_id, country, pool) if c["id"] != -1]
+        _sp_all = _v4_pool_with_scores(tournament_id, country, pool)
+        _sp = [c for c in _sp_all if c["id"] != -1]
         _asg, _m = _v4.best_xi(list(FORMATION_SLOTS.get(formation, _INTL_MATCHDAY_STARTER_POS)), _sp)
         id_to_row = {r["id"]: r for r in pool}
         starters, _slots = [], {}
@@ -6512,6 +6823,9 @@ def _pick_intl_starters(tournament_id, country, avg_ovr):
                 _slots[_c["id"]] = _s
         for r in starters:
             r["slot"] = _slots.get(r["id"], "")
+        if formation in FORMATION_SLOTS:
+            # [2026-11-21] 실제 대회 포메이션·주전 기준 마지막 측면 확인(후보만 교체) — 주전 저장 직전.
+            _v4_first_match_side_fix(tournament_id, country, formation, _sp_all, [r["id"] for r in starters])
         set_intl_squad_starters(tournament_id, country, [r["id"] for r in starters], slots=_slots)
         return starters
     slot_order = FORMATION_SLOTS.get(formation, _INTL_MATCHDAY_STARTER_POS)
@@ -6756,7 +7070,9 @@ def _sim_ai_match(t, m, my_played=False, conn=None, reason="injury", batch=None)
     knockout = m["stage"] not in ("group", "qual_group", "qual_group2")  # [2026-09] 2단계 예선 2차도 무승부 허용
     # [2026-09 신설, 신민용 확정] 예선(wc_qual/cont_qual)이 아닌 대회(월드컵
     # 본선/대륙컵/지역컵)는 홈 어드벤티지 없이 원정 vs 원정.
-    _neutral = t.get("kind") not in ("wc_qual", "cont_qual", "oly_qual")
+    # [2026-11-24] 판정 목록은 constants.INTL_HOME_ADVANTAGE_KINDS 한 곳(국가 파워랭킹과 공유).
+    from constants import intl_kind_is_neutral as _intl_neutral
+    _neutral = _intl_neutral(t.get("kind"))
 
     # [2026-10 6번 ③-1 대표팀] 감독 능력 보정(내가 뛰는 대표팀 경기는 0 — 클럽과 같은 범위)
     _hm = _am = 0.0
@@ -7073,6 +7389,9 @@ def simulate_my_match(week, p, day=None):
     nat = _my_nat(t, p)
     # 예선(wc_qual)은 cap-tie 대상이 아니다 → 국적 고정 안 함.
     _is_qual = t.get("kind") in ("wc_qual", "cont_qual", "oly_qual")
+    # [2026-11-24] 홈 어드밴티지(중립 여부) 판정은 constants.intl_kind_is_neutral 한 곳(국가 파워랭킹과 공유).
+    from constants import intl_kind_is_neutral as _intl_neutral
+    _neutral_k = _intl_neutral(t.get("kind"))
     # [2026-10] U-23 올림픽은 A매치가 아니다 — 국적 고정(cap-tie)·캡·A매치 골 집계에서 뺀다.
     _is_oly_t = _is_oly(t)
     # [복수국적] A매치 첫 출전 → 그 나라로 영구 고정(cap-tie). (본선만)
@@ -7242,7 +7561,7 @@ def simulate_my_match(week, p, day=None):
                               "away": sim.get("away_player_ratings") or []}
             outcome = "draw" if hs == as_ else ("home" if hs > as_ else "away")
         except Exception:
-            outcome = _match_outcome(h_ovr, a_ovr, knockout, neutral=(not _is_qual))
+            outcome = _match_outcome(h_ovr, a_ovr, knockout, neutral=_neutral_k)
             # [2026-09 수정] 전술엔진 폴백도 AI 경기와 같은 스코어 생성기를
             # 타야 한다 — _gen_score를 직접 부르면 국가대표 전력차 스케일
             # 환산(_gen_intl_score 주석 참고)이 빠져 같은 매치업인데도
@@ -7251,7 +7570,7 @@ def simulate_my_match(week, p, day=None):
 
     pso_winner, pso_score = "", ""
     if knockout and outcome == "draw":
-        win_home, pso_score = _resolve_pso(h_ovr, a_ovr, neutral=(not _is_qual))
+        win_home, pso_score = _resolve_pso(h_ovr, a_ovr, neutral=_neutral_k)
         pso_winner = m["home"] if win_home else m["away"]
 
     # [2026-11 국대 체인 이식] _played = 이 경기에 실제로 경기장에 들어갔는가(선발·교체). 캡·A매치 골/도움·
@@ -7441,7 +7760,9 @@ def simulate_my_match(week, p, day=None):
     p2 = get_player()
     # [2026-07 조정, 신민용 지적: "경기 스트레스가 고강도 훈련만큼은 돼야
     # 하지 않나"] 리그/컵/챔스와 동일 원칙으로 상향.
-    ns = min(100, p2["stress"] + 20)
+    # [2026-11 통일] 리그와 같은 결과 기반 공식(game_engine.match_stress_gain) — 예전 +20 고정
+    from game_engine import match_stress_gain
+    ns = min(100, p2["stress"] + match_stress_gain(my_result))
     nh = p2["happiness"]
     if my_result == "win":
         nh = min(100, nh + 4)
@@ -7470,7 +7791,8 @@ def simulate_my_match(week, p, day=None):
         events, _played, _benched, detail, pso=pso,
         engine_stats=engine_stats, engine_plog=engine_plog, player_ratings=player_ratings,
         match_extra={"score_90": ([hs90, as90] if hs90 is not None else [hs, as_]),
-                     "went_extra_time": went_et, "subs": _subs},
+                     "went_extra_time": went_et, "subs": _subs,
+                     "neutral": bool(_neutral_k)},   # [2026-11] 경기 상세 머리글 "(중립)"
         # [2026-10 신설] 이 경기 AI 선수 실측 기록(real_stats)
         real_ctx={"comp": "intl", "tkey": f"intl:{t['id']}", "home": m["home"], "away": m["away"]})
     # [2026-10 4단계] 올림픽 경기는 로그 상자를 은색으로(log_panel "olympic").
@@ -8410,8 +8732,17 @@ def _finalize_groups(t, next_stage, next_week):
             eliminated.extend(r["country"] for r in rows[3:])
 
     # 3위 팀 진출 처리 (48개국 월드컵 & 대륙컵 & 지역컵 공통, n_best는 위에서 이미 결정됨)
+    # [2026-11 버그수정, 신민용 리포트: "랭킹 평가전 조별리그에서 탈락했는데
+    # 메인 화면에 4강 (미정)이 뜬다"] 예전엔 `if n_best > 0 and thirds:` 안에서만
+    # 3위를 탈락 처리했다 — 3위 구제가 없는 형식(n_best == 0: 랭킹 평가전,
+    # 64개국 월드컵, best_thirds=0인 지역컵)은 이 블록을 통째로 건너뛰어서
+    # 3위 팀이 alive=1로 남았다. 그 결과 (1) get_my_pending_stage가 내 국가를
+    # 아직 살아있다고 보고 4강·결승 placeholder를 "미정"으로 띄웠고,
+    # (2) _record_my_exit("조별리그 탈락")도 안 불려 이 대회 성적이 기록되지
+    # 않았다. n_best가 0이어도 3위 전원을 탈락시키도록 조건에서 n_best를 뺀다
+    # (n_best == 0이면 adv가 빈 리스트라 thirds 전부가 탈락 쪽으로 간다).
     best_thirds = []
-    if n_best > 0 and thirds:
+    if thirds:
         thirds.sort(key=lambda gr: (gr[1]["pts"], gr[1]["gf"] - gr[1]["ga"],
                                     gr[1]["gf"], gr[1]["ovr"]), reverse=True)
         adv = thirds[:n_best]
@@ -9527,8 +9858,8 @@ def _v41_candidate_metrics(candidates, year):
         for i in range(0, len(tids), 500):
             ch = tids[i:i + 500]
             ph = ",".join("?" * len(ch))
-            for r in conn.execute(f"""SELECT t.id, t.current_tier, cn.name FROM teams t JOIN leagues l ON t.league_id=l.id
-                                      JOIN countries cn ON l.country_id=cn.id WHERE t.id IN ({ph})""", ch):
+            for r in conn.execute(f"""SELECT t.id, t.current_tier, cn.name FROM teams t {_VY.nt_join(conn)}
+                                      WHERE t.id IN ({ph})""", ch):   # [2026-11-22 1단계] 가상 유스 팀 = 가상 리그 수준
                 tl[r[0]] = (r[2], r[1] or 1)
     finally:
         conn.close()

@@ -425,12 +425,27 @@ def find_destinations(p, purpose, exec_y, exec_w, rng, k=MY_LOAN_MAX_OFFERS):
 # ── 구단 임대 추진 ───────────────────────────────────────────────
 def _club_push_check(p, year, week):
     ge = _ge()
-    if week not in MY_LOAN_PUSH_WEEKS:
+    # [2026-11-20 신설, 신민용+GPT 확정 — 임대 판정 시점] constants.MY_LOAN_TWO_STEP이 켜져 있으면 상반기
+    # 판정을 두 단계로 나눈다: 22주(MY_LOAN_CANDIDATE_WEEK)엔 육성·정리 대상을 후보로만 기록하고(제안 없음),
+    # 25주(MY_LOAN_REEVAL_WEEK)에 후보였던 경우만 아래 판정을 처음부터 다시 해서 여전히 육성·정리면 제안한다
+    # (27주 이동까지 2주 답할 시간). 22~25주 사이 출전이 늘어 일반·핵심이 되면 후보에서 빠진다. 40주는 그대로.
+    import constants as _C
+    two_step = bool(getattr(_C, "MY_LOAN_TWO_STEP", False))
+    if two_step and week == _C.MY_LOAN_REEVAL_WEEK:
+        if (p.get("club_loan_candidate") or 0) != year:
+            return
+        stage = "reeval"
+    elif week in MY_LOAN_PUSH_WEEKS:
+        stage = "candidate" if (two_step and week == _C.MY_LOAN_CANDIDATE_WEEK) else "decide"
+    else:
         return
     key = year * 100 + week
     if (p.get("club_loan_push_last") or 0) == key:
         return
-    ge.update_player(club_loan_push_last=key)
+    if stage == "reeval":
+        ge.update_player(club_loan_push_last=key, club_loan_candidate=0)   # 후보는 이번 재평가로 소진
+    else:
+        ge.update_player(club_loan_push_last=key)
     if _busy_reason(p):
         return   # 임대 불가 상태(임대 중·복무·이적/임대 예약·판매 제안 대기 등) — 판매 추진도 그대로
     plan, info = club_plan(p, year, week)
@@ -446,6 +461,13 @@ def _club_push_check(p, year, week):
     elif plan == "육성":
         purpose = "육성"   # 육성은 임대 우선(신민용 확정) — 단, 실제 임대 제안이 만들어질 때만
     else:
+        return
+    if stage == "candidate":
+        # [2026-11-20] 22주: 후보 기록만 — 임대처 탐색·제안·판매 추진 해제는 25주 재평가 때 한다.
+        ge.update_player(club_loan_candidate=year)
+        if loan_shown:
+            ge.add_log(f"📋 구단이 겨울 임대를 검토하고 있습니다 — {_C.MY_LOAN_REEVAL_WEEK}주에 출전 상황을 "
+                       f"다시 보고 결정합니다.", "event", year, week)
         return
     ex_y, ex_w = next_window(year, week)
     offers = find_destinations(p, purpose, ex_y, ex_w, _rng("push", year, week))

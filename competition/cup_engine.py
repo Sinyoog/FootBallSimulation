@@ -484,6 +484,7 @@ def get_my_cup_match(week, day=None, p=None, st=None, include_played=False):
         "round_name": m["round_name"],
         "opp": oe["team_name"] if oe else "?",
         "is_home": is_home,
+        "neutral": is_neutral_round(m["round_name"]),   # [2026-11] 결승·3·4위전 — 화면에 "중립"
         "week": week,
     }
 
@@ -1003,7 +1004,26 @@ def _entry(tid, team_id):
     return result
 
 
-def _match_outcome(h_ovr, a_ovr, h_mgr=0.0, a_mgr=0.0):
+# [2026-11 신설, 신민용 확정] 국내컵 결승(과 3·4위전)은 중립 경기장 — 홈 이점 0, 화면에도
+# 홈/원정 대신 "중립". 그 전 라운드는 리그와 같은 홈 이점(1.5~4.5)을 내 경기·체인 경기·AI 공식
+# 모두 똑같이 준다(예전엔 AI 공식에만 홈 이점이 있고 내 경기·체인 경기는 0이었다).
+# 3·4부 국내컵(lower_cup_engine)도 이 판정을 그대로 쓴다.
+CUP_NEUTRAL_ROUNDS = ("결승", "3·4위전")
+
+
+def is_neutral_round(round_name) -> bool:
+    return (round_name or "") in CUP_NEUTRAL_ROUNDS
+
+
+def cup_home_adv(round_name) -> float:
+    """체인 엔진에 넘길 홈 이점 — 중립 라운드면 0, 아니면 리그와 같은 1.5~4.5."""
+    if is_neutral_round(round_name):
+        return 0.0
+    from game_engine import _home_advantage
+    return _home_advantage()
+
+
+def _match_outcome(h_ovr, a_ovr, h_mgr=0.0, a_mgr=0.0, neutral=False):
     """[2026-07 재조정, 신민용 지적: "컵대회 우승팀이 리그에서는 10등,
     챔스 우승팀이 리그 하위권인 게 이상하다"] 이 함수가 리그(_match_win_probs)/
     국제대회(intl_engine._match_outcome)와 똑같은 예전 완만한 공식(계수
@@ -1024,7 +1044,11 @@ def _match_outcome(h_ovr, a_ovr, h_mgr=0.0, a_mgr=0.0):
     #    (0.24, 0.009)을 그대로 둔다 — 단판 토너먼트의 변동성은 이 무승부·
     #    승부차기 구간이 남겨준다.
     # 3·4부 국내컵(lower_cup_engine)도 이 함수를 그대로 쓴다.
+    # [2026-11] 결승·3·4위전(중립)은 홈 이점 0. 난수는 그대로 한 번 소비해서 중립이 아닌 경기의
+    # 난수 흐름(=결과)이 예전과 같게 둔다.
     _ha = random.uniform(1.5, 4.5)
+    if neutral:
+        _ha = 0.0
     from constants import MANAGER_MATCH_REL
     if MANAGER_MATCH_REL and (h_mgr or a_mgr):
         # [2026-11 상대 비교형] 감독 가산은 팀 전력 단위 — 곡선 앞에서 더한다.
@@ -1087,18 +1111,19 @@ def _sim_ai_match(t, m, conn=None, reason="injury", batch=None, forced=None):
     # [2026-10 6번 ③-1] 감독 능력 보정(내 팀 경기는 0)
     from game_engine import _mgr_match_bonus_pair
     _hm, _am = _mgr_match_bonus_pair(None, m["home_team_id"], m["away_team_id"])
+    _neutral = is_neutral_round(m.get("round_name"))   # [2026-11] 결승·3·4위전 = 중립
     _g2 = None
     if forced is None:
         # [G2] 사용자 감독 팀·구단주 구단 경기 → 체인 엔진(controlled_matches). 대상이 아니면 None.
         import controlled_matches as _cm
         _g2_t = _cm.target_team_ids()
         if _g2_t and (m["home_team_id"] in _g2_t or m["away_team_id"] in _g2_t):
-            _g2 = _cm.sim_target_match(m["home_team_id"], m["away_team_id"], home_adv=0.0, extra_time=True,
+            _g2 = _cm.sim_target_match(m["home_team_id"], m["away_team_id"], home_adv=cup_home_adv(m.get("round_name")), extra_time=True,
                                        comp_name=f"{t['name']} {m.get('round_name') or ''}".strip(), kind="cup", week=m.get("week"), day=m.get("day"),
                                        targets=_g2_t, strength_rule="cup")   # [2026-11] 대회별 전력 가산(D)
         if _cm.covered("cup_entries", "cup_matches", t["id"]):
             # [2026-10 A안] 내가 참가하는 대회의 AI 경기 — 엔진으로 돌려 실측 기록(controlled_matches.sim_cover_match)
-            _g2 = _cm.sim_cover_match(m["home_team_id"], m["away_team_id"], home_adv=0.0, extra_time=True,
+            _g2 = _cm.sim_cover_match(m["home_team_id"], m["away_team_id"], home_adv=cup_home_adv(m.get("round_name")), extra_time=True,
                                       comp="cup", tkey=f"cup:{t['id']}", targets=_g2_t, prior=_g2,
                                       strength_rule="cup")   # [2026-11] 대회별 전력 가산(D)
         if _g2 is not None:
@@ -1106,7 +1131,7 @@ def _sim_ai_match(t, m, conn=None, reason="injury", batch=None, forced=None):
     if forced is not None:   # [G1] 내 팀 경기(내가 결장) — 체인 엔진 스코어(연장 포함)
         outcome = "draw" if forced[0] == forced[1] else ("home" if forced[0] > forced[1] else "away")
     else:
-        outcome = _match_outcome(he["ovr"], ae["ovr"], _hm, _am)
+        outcome = _match_outcome(he["ovr"], ae["ovr"], _hm, _am, neutral=_neutral)
     pso_winner, pso_score = 0, ""
     if outcome == "draw":
         win_home, pso_score = _resolve_pso(he["ovr"], ae["ovr"])
@@ -1187,8 +1212,8 @@ def sim_my_cup_match_as_ai(week, p, reason="injury", day=None):
     if m["home_score"] != -1:
         return  # 이미 처리됨(멱등)
     from game_engine import _chain_team_score
-    _cs = _chain_team_score(m["home_team_id"], m["away_team_id"], 0.0, extra_time=True,
-                            strength_rule="cup")   # [2026-11 전력 기준 통일]
+    _cs = _chain_team_score(m["home_team_id"], m["away_team_id"], cup_home_adv(m.get("round_name")), extra_time=True,
+                            strength_rule="cup")   # [2026-11] 결승·3·4위전만 중립   # [2026-11 전력 기준 통일]
     _sim_ai_match(t, m, reason=reason,
                   forced=((_cs["home_score"], _cs["away_score"]) if _cs is not None else None))
     from game_engine import update_player, _calc_manager_rel
@@ -1197,7 +1222,8 @@ def sim_my_cup_match_as_ai(week, p, reason="injury", day=None):
     import controlled_matches as _cm_abs
     _cm_abs.save_absent_match(_cs, m["home_team_id"], m["away_team_id"], info.get("is_home"),
                               t.get("name") or "국내컵", "cup", week=week, day=m.get("day") or day,
-                              reason=reason, real_ctx={"comp": "cup", "tkey": f"cup:{m['tournament_id']}"})
+                              reason=reason, real_ctx={"comp": "cup", "tkey": f"cup:{m['tournament_id']}"},
+                              neutral=bool(info.get("neutral")))   # [2026-11] 중립 경기면 상세·로그에 "중립"
 
 
 def simulate_my_cup_match(week, p, day=None):
@@ -1265,6 +1291,8 @@ def simulate_my_cup_match(week, p, day=None):
     # 와 동일한 패턴으로 확장한다. 이 대회는 원래도 h_ovr/a_ovr 계산에
     # 홈 어드밴티지 항을 넣지 않으므로(중립 판정과 동일한 기존 동작) 그대로
     # home_adv=0.0.
+    # [2026-11 변경, 신민용 확정] 이제 결승·3·4위전만 중립(0)이고 그 전 라운드는
+    # 리그와 같은 홈 이점을 준다(cup_home_adv) — 위 "home_adv=0.0" 설명은 예전 동작.
     my_position = p.get("position", "")
     engine_stats = None
     engine_plog = None
@@ -1286,7 +1314,7 @@ def simulate_my_cup_match(week, p, day=None):
         _fconn.close()
         sim = simulate_my_match(
             m["home_team_id"], m["away_team_id"], home_formation, away_formation,
-            home_adv=0.0,
+            home_adv=cup_home_adv(m.get("round_name")),   # [2026-11] 결승·3·4위전만 중립, 그 전 라운드는 홈 이점
             extra_time=True,
             me=_chain_me_spec(p, is_home, "out" if _suspended else ("bench" if _benched else "start")),
             strength_rule="cup")   # [2026-11 전력 기준 통일] AI 경기와 같은 전력
@@ -1305,7 +1333,7 @@ def simulate_my_cup_match(week, p, day=None):
         _chain_note_error(__name__, _e_chain)
         _chain = None
         engine_stats = engine_plog = player_ratings = None
-        outcome = _match_outcome(h_ovr, a_ovr)
+        outcome = _match_outcome(h_ovr, a_ovr, neutral=is_neutral_round(m.get("round_name")))
         hs, as_ = _gen_score(outcome, h_ovr - a_ovr, allow_extreme=True, top=(h_ovr, a_ovr))
 
     pso_winner, pso_score = 0, ""
@@ -1422,7 +1450,9 @@ def simulate_my_cup_match(week, p, day=None):
     # 하지 않나"] 리그 경기와 동일 원칙 — 고강도 훈련(20)과 최소 동급으로
     # 올림. 컵대회는 홈/원정·나이 구분 없이 단일 값을 쓰는 기존 구조는
     # 유지하고 크기만 리그 스케일에 맞췄다.
-    ns = min(100, p2["stress"] + 20)
+    # [2026-11 통일] 리그와 같은 결과 기반 공식(game_engine.match_stress_gain) — 예전 +20 고정
+    from game_engine import match_stress_gain
+    ns = min(100, p2["stress"] + match_stress_gain(my_result))
     nh = p2["happiness"]
     if my_result == "win":
         nh = min(100, nh + 4)
@@ -1450,7 +1480,8 @@ def simulate_my_cup_match(week, p, day=None):
         events, not (_suspended or _benched), _benched, detail, pso=pso,
         engine_stats=engine_stats, engine_plog=engine_plog, player_ratings=player_ratings,
         match_extra={"score_90": ([hs90, as90] if hs90 is not None else [hs, as_]),
-                     "went_extra_time": went_et, "subs": _subs},
+                     "went_extra_time": went_et, "subs": _subs,
+                     "neutral": bool(is_neutral_round(m.get("round_name")))},   # [2026-11] 경기 상세 머리글 "(중립)"
         # [2026-10 신설] 이 경기 AI 선수 실측 기록(real_stats)
         real_ctx={"comp": "cup", "tkey": f"cup:{m['tournament_id']}", "home": m["home_team_id"], "away": m["away_team_id"]})
     marker = f" [match:{detail_id}:cup]" if detail_id else ""

@@ -505,6 +505,7 @@ def get_my_cl_match(week, day=None, p=None, st=None):
         "opp": oe["team_name"] if oe else "?",
         "opp_flag": oe["flag"] if oe else "",
         "is_home": is_home,
+        "neutral": m["stage"] in CHAMPIONS_CFG.neutral_stages,   # [2026-11] 중립 경기(결승 등) — 시뮬이 home_adv=0이라 화면에도 홈/원정 대신 "중립"
         "week": week,
     }
 
@@ -893,7 +894,8 @@ def sim_my_cl_match_as_ai(week, p, reason="injury", day=None):
                               (_stage_label(f"{t.get('name') or '챔피언스리그'} {STAGE_KO.get(m['stage'], '')}", _leg)
                                if _leg else (t.get("name") or "챔피언스리그")), "cl",
                               week=week, day=m.get("day") or day,
-                              reason=reason)
+                              reason=reason,
+                              neutral=bool(info.get("neutral")))   # [2026-11] 중립 경기면 상세·로그에 "중립"
 
 
 def simulate_my_cl_match(week, p, day=None):
@@ -1156,7 +1158,9 @@ def simulate_my_cl_match(week, p, day=None):
     p2 = get_player()
     # [2026-07 조정, 신민용 지적: "경기 스트레스가 고강도 훈련만큼은 돼야
     # 하지 않나"] 리그/컵과 동일 원칙으로 상향.
-    ns = min(100, p2["stress"] + 20)
+    # [2026-11 통일] 리그와 같은 결과 기반 공식(game_engine.match_stress_gain) — 예전 +20 고정
+    from game_engine import match_stress_gain
+    ns = min(100, p2["stress"] + match_stress_gain(my_result))
     nh = p2["happiness"]
     if my_result == "win":
         nh = min(100, nh + 4)
@@ -1191,7 +1195,8 @@ def simulate_my_cl_match(week, p, day=None):
         events, not (_suspended or _benched), _benched, detail, pso=pso,
         engine_stats=engine_stats, engine_plog=engine_plog, player_ratings=player_ratings,
         match_extra={"score_90": ([hs90, as90] if hs90 is not None else [hs, as_]),
-                     "went_extra_time": went_et, "subs": _subs},
+                     "went_extra_time": went_et, "subs": _subs,
+                     "neutral": bool(_neutral_stage)},   # [2026-11] 경기 상세 머리글 "(중립)"
         # [2026-10 신설] 이 경기 AI 선수 실측 기록(real_stats)
         real_ctx={"comp": "cl", "tkey": f"cl_tournaments:{m['tournament_id']}", "home": m["home_team_id"], "away": m["away_team_id"]})
     marker = f" [match:{detail_id}:cl]" if detail_id else ""

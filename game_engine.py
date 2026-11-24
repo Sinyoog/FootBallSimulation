@@ -1,5 +1,6 @@
 # game_engine.py
 import random
+import virtual_youth as _VY   # [2026-11-22 1단계] 가상 유스 공통 판정
 import math
 import json
 import sqlite3
@@ -1532,7 +1533,7 @@ def _season_team_league_matches(c, year):
     m = _season_team_league_map(c, year)
     team_lid = {}
     n_by_league = {}
-    for tid, lid_now in c.execute("SELECT id, league_id FROM teams").fetchall():
+    for tid, lid_now in c.execute("SELECT id, league_id FROM teams" + _VY.where_not_vt(c)).fetchall():   # [2026-11-22 1단계] 가상 유스 제외
         lid = m.get(tid, lid_now)
         team_lid[tid] = lid
         n_by_league[lid] = n_by_league.get(lid, 0) + 1
@@ -2811,6 +2812,20 @@ _team_formation_cache: dict = {}
 
 def _home_advantage():
     return random.uniform(1.5, 4.5)
+
+
+def match_stress_gain(my_result):
+    """[2026-11 통일, 신민용 확정: "전 대회 리그 공식으로 통일"] 내 경기 1경기의 스트레스 증가량.
+    리그(2026-08 개편: 홈/원정·나이 차등 없이 결과 기반)와 같은 공식을 모든 대회가 같이 쓴다 —
+    예전엔 챔스·유로파·컨퍼·슈퍼컵·클럽월드컵·국내컵·국내 슈퍼컵·국대·승강 PO가 그 개편에서
+    빠져 결과 상관없이 +20 고정이었다. 승 +6 / 무 +11 / 패 +16(constants 값 기준)."""
+    return MATCH_STRESS_BASE + MATCH_RESULT_STRESS_MOD.get(my_result, 0)
+
+
+def match_stress_range():
+    """메인 화면 미리보기용 (최소, 최대) — 경기 전엔 결과를 모르므로 승~패 범위로 보여준다."""
+    vals = [match_stress_gain(r) for r in ("win", "draw", "loss")]
+    return min(vals), max(vals)
 
 
 def _team_formation(c, team_id):
@@ -4922,7 +4937,7 @@ def _simulate_match(p, week, info: dict, day=None):
     # 라이벌전/컵결승/연패 같은 상황을 result_modifier 옆에 얹기 쉽게
     # 한다. 홈/원정·나이 차등은 이번 개편으로 제거 — 결과 기반이 주축이
     # 되고, 장기 나이 효과는 이미 injury_load의 age_mult가 담당.
-    match_stress = MATCH_STRESS_BASE + MATCH_RESULT_STRESS_MOD.get(my_result, 0)
+    match_stress = match_stress_gain(my_result)
     ns = min(100, p["stress"] + match_stress)
     # [2026-08 v5 재수정 — 실측 후 재설계] 훈련이 독립 작은 스케일로
     # 바뀌면서 경기도 그 스케일에 맞는 자체 값(INJURY_LOAD_MATCH_VALUE)을
@@ -5483,7 +5498,10 @@ def _roll_red_card(p):
     PERSONALITY_EFFECTS의 red_card_chance만큼 가산된다."""
     pe = PERSONALITY_EFFECTS.get(p.get("personality", ""), {})
     chance = BASE_RED_CARD_CHANCE + pe.get("red_card_chance", 0.0)
-    return random.random() < chance
+    _r = random.random()
+    if pe.get("no_cards"):      # [2026-11-21] 페어플레이어 — 난수는 그대로 소비하고 카드는 없다
+        return False
+    return _r < chance
 
 
 # [2026-10 신설, 신민용 리포트: "출전정지로 결장이라 뜨는데 그 전 경기엔 옐로만 있고 레드는 없다"]
@@ -5655,7 +5673,10 @@ def _roll_yellow_card(p):
     EFFECTS의 yellow_card_chance만큼 가산된다."""
     pe = PERSONALITY_EFFECTS.get(p.get("personality", ""), {})
     chance = BASE_YELLOW_CARD_CHANCE + pe.get("yellow_card_chance", 0.0)
-    return random.random() < chance
+    _r = random.random()
+    if pe.get("no_cards"):      # [2026-11-21] 페어플레이어 — 난수는 그대로 소비하고 카드는 없다
+        return False
+    return _r < chance
 
 
 def _roll_card_events(p, field):
@@ -5787,7 +5808,8 @@ def _chain_me_spec(p, is_home, status):
     return {"player": pl, "side": ("home" if is_home else "away"), "status": status,
             "field_pos": get_field_pos(p),
             "yellow_add": _pe.get("yellow_card_chance", 0.0) / CHAIN_MY_FOULS_PER_MATCH,
-            "red_add": _pe.get("red_card_chance", 0.0) / CHAIN_MY_FOULS_PER_MATCH}
+            "red_add": _pe.get("red_card_chance", 0.0) / CHAIN_MY_FOULS_PER_MATCH,
+            "no_cards": bool(_pe.get("no_cards"))}     # [2026-11-21] 페어플레이어
 
 
 def _apply_chain_cards(p, field, n_yellow, red_reason):
@@ -7908,6 +7930,9 @@ def _save_match_detail(p, week, comp_name, is_home, home_name, away_name,
         "score_90": (match_extra or {}).get("score_90"),
         "went_extra_time": bool((match_extra or {}).get("went_extra_time")),
         "subs": (match_extra or {}).get("subs") or {"home": [], "away": []},
+        # [2026-11 신설] 중립 경기(결승·국대 본선 등 홈 이점 0) — 경기 상세 머리글에 홈/원정 대신 "중립".
+        # 예전 저장분은 키가 없어 예전처럼 홈/원정으로 보인다.
+        "neutral": bool((match_extra or {}).get("neutral")),
     }
     # [2026-10 신설, 신민용 확정] 내 경기의 AI 선수 실측 기록 — 시즌·대회 기록과 개인상이 추정치 대신 쓴다
     # (real_stats 모듈 docstring 참고). 경기 상세에 저장되는 player_ratings와 같은 값이다.
@@ -10174,7 +10199,16 @@ def reserve_join_transfer(team_id, salary, team_name, transfer_type="오퍼", of
     if transfer_type == "오퍼" and offer is not None:
         _p0 = get_player()
         if _p0 and _p0.get("current_team_id"):
-            if not _offer_sale_gate(_p0, offer):
+            if offer.get("_high_value_sale"):
+                # [2026-11-20 신설] 고가 매각 제안 수락 — 구단이 먼저 매각에 동의한 것이라 판매 승인 판정을
+                # 다시 하지 않는다(정상 승인과 같이 거절 누적은 초기화).
+                add_log(f"💰 구단이 {offer.get('team_name', team_name)}의 제안"
+                        f"({fmt_money(offer.get('transfer_fee', 0))})을 받아들여 매각에 동의했습니다.", "news")
+                _reset_offer_rejection()
+            elif offer.get("_transfer_request_ok"):
+                # [2026-11-21] 이적 요청 재평가에서 구단이 이미 승인한 오퍼 — 판정을 다시 하지 않는다(로그는 request_transfer).
+                pass
+            elif not _offer_sale_gate(_p0, offer):
                 _prev = _p0.get("pending_join_transfer_json") or ""
                 if _prev:
                     try:
@@ -19988,7 +20022,7 @@ def _compute_league_individual_awards(year, my_ctx=None):
         # 기록이 아예 없는 예외)만 기존처럼 teams.league_id로 폴백한다.
         _team_league_map = _team_league_id_map_for_year(c, year)
         _teams_by_league = {}
-        for _tr in c.execute("SELECT id, league_id FROM teams ORDER BY id").fetchall():
+        for _tr in c.execute("SELECT id, league_id FROM teams" + _VY.where_not_vt(c) + " ORDER BY id").fetchall():   # [2026-11-22 1단계] 가상 유스 제외
             _lid = _team_league_map.get(_tr["id"], _tr["league_id"])
             _teams_by_league.setdefault(_lid, []).append(_tr["id"])
         # 리그별 풀시즌 경기수 — _league_full_season_matches와 같은 공식
@@ -21605,7 +21639,8 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
                 JOIN countries cn2 ON cn2.name = a.nationality
                 WHERE cn2.continent IN ({}) AND a.position IN ({})
                 """.format(",".join("?" * len(_same_award_conts)),
-                           ",".join("'%s'" % pp for pp in ATTACK_POS)), _same_award_conts).fetchone()
+                           ",".join("'%s'" % pp for pp in ATTACK_POS)) + _VY.and_not_vp(c, "a.team_id"),
+                _same_award_conts).fetchone()   # [2026-11-22 1단계] 가상 유스 제외
             _cont_rival_ovr = _cont_rival["mo"] if _cont_rival and _cont_rival["mo"] else 80
             _cont_world_class = p.get("ovr", 0) >= _cont_rival_ovr - 2
             # 대륙상은 발롱도르보다 후보군이 작으므로 생산력 문턱을 30% 낮춘다.
@@ -22106,21 +22141,6 @@ def _end_of_season(p, year, progress_cb=None):
     # 작다).
     from database import history_drain
     history_drain()
-    # [2026-11-20 버그수정, 신민용 리포트: "16세에 1부 28골·리그 MVP인데 골든보이 후보에도 없다"] 개인상의 내 역할
-    # 게이트(_AWARD_EXCLUDED_ROLES — 대기·전력외·유망주)는 my_player_position_history의 그 해 행을 읽는데, 그 해 실제
-    # 출전으로 보정한 역할 스냅샷(snapshot_my_player_position)은 이 함수 뒤쪽(개인상 계산 다음)에서야 찍혔다. 그래서
-    # 개인상은 입단 순간 OVR로 정한 역할(16세 입단 = 유망주)을 그대로 읽어, 한 시즌 내내 주전으로 뛴 선수도 골든보이·
-    # 코파 트로피·발롱도르·세계 베스트 11 후보에서 빠졌다. 같은 스냅샷을 개인상 계산 직전에 한 번 더 찍는다(그 해
-    # 시즌 기록 my_player_season_stats는 위에서 이미 저장됨). 뒤쪽 원래 호출은 그대로 둔다(같은 계산을 다시 저장).
-    # 전역 난수는 건드리지 않게 상태를 되돌린다.
-    _rs_snap = random.getstate()
-    try:
-        from ai_lifecycle import snapshot_my_player_position as _snap_my_pos
-        _snap_my_pos(year)
-    except Exception as _e:
-        print(f"[내 포지션 아카이브 오류(개인상 전)] {year}년: {_e}")
-    finally:
-        random.setstate(_rs_snap)
     _compute_season_individual_awards(year, my_ctx=_my_ctx)
     # [2026-09 신설, 히스토리 비동기 writer] _process_awards(바로 아래)는
     # "이 결과를 조회만 함"(위 _compute_season_individual_awards docstring
@@ -25824,7 +25844,7 @@ def _generate_all_league_schedules(season: int, year: int):
 
         # 1) 리그별 팀 목록(팀 수 상한 없음 — 8팀 고정 캡 제거) 한 번에 조회
         teams_by_league: dict = {}
-        for r in c.execute("SELECT id, league_id FROM teams ORDER BY league_id, id"):
+        for r in c.execute("SELECT id, league_id FROM teams" + _VY.where_not_vt(c) + " ORDER BY league_id, id"):   # [2026-11-22 1단계] 가상 유스 제외
             lst = teams_by_league.setdefault(r["league_id"], [])
             lst.append(r["id"])
 
@@ -26650,7 +26670,8 @@ def _generate_offers_impl(count=5, force=False) -> list:
     # 옴" 예외를 그대로 유지한다. 강제판매(별도 로직)는 이 토글과 무관.
     # force=True(강제 입단)면 이 뮤트 자체를 아예 건너뛴다 — 위 버그수정
     # 주석 참고.
-    if not force and not p.get("offers_enabled", 1) and not p.get("transfer_requested"):
+    # [2026-11-21] 이적 요청은 더 이상 오퍼 OFF 예외가 아니다(거절된 오퍼 재평가 장치로 재설계).
+    if not force and not p.get("offers_enabled", 1):
         return []
 
     # [2026-07 재설계 v2, 신민용 최종안] 상황별로 의도적으로 차이를 크게
@@ -26665,7 +26686,6 @@ def _generate_offers_impl(count=5, force=False) -> list:
     #       직전리그 8 + 자국 3 + 기타 4 = 15
     #     직전 리그가 자국이었다면(또는 커리어 기록 없음)
     #       자국 10 + 기타 5 = 15
-    transfer_req = bool(p.get("transfer_requested"))
     # 구단 판매 추진 신호 — 관심 배율(O-1, 기존 점수표 그대로)
     _sale_push_mult = 1.0
     if p.get("sale_push_active") and p.get("allow_club_sale_push", 1):
@@ -26715,9 +26735,6 @@ def _generate_offers_impl(count=5, force=False) -> list:
             _team_avg_cache_offers[r["team_id"]] = r["avg_ovr"]
 
     _team_floor_on = [True]   # 첫 입단이면 끈다(아래 O-1 블록)
-    _brk_full_ok = [False]    # [2026-11-20 O1_BRK B] 유망주 만석 예외 대상인가(아래 O-1 블록에서 정함)
-    _brk_me_country = [None]  # 지금 리그 나라(예외는 다른 나라 리그 구단만)
-    _stt_brk = [0]            # 예외로 만석을 통과한 구단 수(통계)
     from constants import OFFER_FLOOR_REF_TOPN, OFFER_STAR_FULL_BYPASS_GAP
     _top_avgs = sorted(_team_avg_cache_offers.values(), reverse=True)[:OFFER_FLOOR_REF_TOPN]
     _elite_team_avg = (sum(_top_avgs) / len(_top_avgs)) if _top_avgs else _effective_ovr
@@ -26732,13 +26749,15 @@ def _generate_offers_impl(count=5, force=False) -> list:
             _ta = _team_avg_cache_offers.get(team_row["id"])
             if _ta is not None and _effective_ovr >= _ta + OFFER_STAR_FULL_BYPASS_GAP:
                 return False
-            _full = _team_headcount_cache_offers.get(team_row["id"], 0) >= 26
-            # [2026-11-20 O1_BRK B] 유망주 만석 예외 — 다른 나라 리그 구단만(constants O1_BRK_* 주석).
-            if _full and _brk_full_ok[0] and team_row["country"] not in _my_nat_names \
-                    and team_row["country"] != _brk_me_country[0]:
-                _stt_brk[0] += 1
-                return False
-            return _full
+            return _team_headcount_cache_offers.get(team_row["id"], 0) >= 26
+        return False
+
+    def _team_at_capacity(team_row) -> bool:
+        """[2026-11-21 C] 26명 고정 리그 팀인데 이미 26명인가(예외 없이 순수 정원 판정). 프로 이적 오퍼는 여기에
+        입단 후 역할(O1_FULL_BYPASS_ROLES)로 예외를 건다 — _team_full_fixed26의 OVR+5 예외는 첫 입단(FJ2)에만 남는다."""
+        from ai_lifecycle import _is_fixed26
+        if _is_fixed26(get_country_league_grade(team_row["country"], team_row["grade"]), team_row["tier"]):
+            return _team_headcount_cache_offers.get(team_row["id"], 0) >= 26
         return False
 
     def _team_below_floor(team_row) -> bool:
@@ -26772,11 +26791,13 @@ def _generate_offers_impl(count=5, force=False) -> list:
     # (확률 성사)에서 3개만 남았다. 프로 경력(career_entries 팀 기록)이 없으면 나이와 무관하게 첫 입단.
     # ── [2026-11-16 신설, 신민용 확정 — O-1] 관심 → 적합성 → 연결 (constants O1_* 주석 참고) ──────────────
     from constants import (O1_REL_BASE, O1_ACT_FLOOR, O1_MIN_MATCHES, O1_RATING_BASE, O1_RATING_SPAN,
-                           O1_INTL_MULT, O1_TRANSFER_REQ_MULT, O1_FIRST_DOM_BASE, O1_FIRST_DOM_BASE_LOW,
+                           O1_INTL_MULT, O1_FIRST_DOM_BASE, O1_FIRST_DOM_BASE_LOW,
                            O1_FIRST_FOR_BASE, O1_TALENT_CLASS, O1_TALENT_DOM_MULT, O1_TALENT_FOR_MULT,
                            O1_PRESTIGE_MULT, O1_FIRST_AGE_MULT, O1_FIRST_AGE_MULT_OLD, O1_INTEREST_CAP,
                            O2_CONN, O2_SPECIALTY_GRADES, O2_SPECIALTY_MULT, O2_CONN_CAP,
-                           O2_BEST_GUARANTEE_GRADES, get_contract_urgency_mult)
+                           O2_BEST_GUARANTEE_GRADES, get_contract_urgency_mult,
+                           O1_VIS_MULT, O1_VIS_RELS, O1_LOWER_LEVEL_STEP_MULT, O1_FULL_BYPASS_ROLES,
+                           O1_SAME_COUNTRY_LOWER_STEP_MULT)
     from data.prestige_clubs import prestige_level as _prestige_level
     from database import get_world_salt
     # 첫 입단 = 프로 경력(career_entries 팀 기록) 없음. 나이와 무관.
@@ -26802,6 +26823,19 @@ def _generate_offers_impl(count=5, force=False) -> list:
                           "WHERE t.id=?", (_ref_tid,)).fetchone()
         if _r_me:
             _me_lid, _me_country, _me_tier, _me_cont = _r_me["lid"], _r_me["country"], _r_me["tier"], _r_me["cont"]
+
+    # [2026-11-21 A·B] 리그 수준 = _GATE_GRADE_ORDER 순번(SS=0 … F=7) — 리그 등급을 부수만큼 내린 값.
+    # [2026-11-21 신민용 확정] 선수 발견(관심) 범위에서는 SS와 S를 같은 등급으로 본다 — 부수를 내리기 전에 SS→S
+    # (EPL 1부 = 라리가·분데스 1부 = S, 챔피언십 = 분데스 2부 = A). 리그 경쟁력·다른 판정은 그대로.
+    def _o1_level(country, cgrade, tier):
+        _lg = get_country_league_grade(country, cgrade)
+        _g = _gate_grade_for_tier("S" if _lg == "SS" else _lg, tier or 1)
+        return _GATE_GRADE_ORDER.index(_g) if _g in _GATE_GRADE_ORDER else len(_GATE_GRADE_ORDER) - 1
+    _me_level = None
+    if _me_country is not None:
+        _r_mg = c.execute("SELECT grade FROM countries WHERE name=?", (_me_country,)).fetchone()
+        _me_level = _o1_level(_me_country, _r_mg["grade"] if _r_mg else None, _me_tier)
+    _me_vis = O1_VIS_MULT.get(_GATE_GRADE_ORDER[_me_level], 1.0) if _me_level is not None else 1.0
 
     # 선수 노출도(프로) — OVR 미포함
     _act = None
@@ -26829,40 +26863,10 @@ def _generate_offers_impl(count=5, force=False) -> list:
     _end_y = p.get("contract_end_year", 0)
     _cur_w = _st_o1.get("current_week", 1) or 1
     _wl = max(0, ((_end_y - _cur_y) * 52 + (52 - _cur_w))) if (_end_y and has_team) else 999
-    _signal_m = (get_contract_urgency_mult(_wl) if has_team else 1.0) \
-        * (O1_TRANSFER_REQ_MULT if transfer_req else 1.0) * _sale_push_mult
+    _signal_m = (get_contract_urgency_mult(_wl) if has_team else 1.0) * _sale_push_mult
     # 첫 입단 스카우팅
     _tclass = O1_TALENT_CLASS.get(p.get("talent_tier") or "", "일반")
     _age_m = next((m for a, m in O1_FIRST_AGE_MULT if age <= a), O1_FIRST_AGE_MULT_OLD)
-    # [2026-11-20 신설, 신민용 확정 — O1_BRK A+B] 돌풍 배율(다른 나라 리그 구단 관심)·유망주 만석 예외. 프로만.
-    from constants import (O1_BRK_ON, O1_BRK_ACT0, O1_BRK_SPAN, O1_BRK_AGE_MAX, O1_BRK_FULL_MAX_AGE,
-                           O1_BRK_FULL_TALENT, O1_BRK_FULL_MIN_B)
-    _brk_b = 0.0
-    _brk_mult = 1.0
-    if O1_BRK_ON and _act is not None:
-        _brk_b = max(0.0, min(1.0, (_act - O1_BRK_ACT0) / O1_BRK_SPAN))
-        _brk_max = next((m for a, m in O1_BRK_AGE_MAX if (age or 99) <= a), 1.0)
-        _brk_mult = 1.0 + _brk_b * (_brk_max - 1.0)
-        _brk_full_ok[0] = ((age or 99) <= O1_BRK_FULL_MAX_AGE and _tclass in O1_BRK_FULL_TALENT
-                           and _brk_b >= O1_BRK_FULL_MIN_B)
-        _brk_me_country[0] = _me_country
-    # [2026-11-20 O1_BRK ① 재측정안] A는 "내 리그보다 등급이 높은 리그의 1부 구단"에만. 등급 = 클럽 리그 등급
-    # (get_country_league_grade), SS와 S는 같은 등급으로 본다(기존 원칙 "SS랑 S는 동급").
-    from economy import LEAGUE_GRADE_RANK as _LGR
-    _brk_rank = lambda _g: min(_LGR.get(_g or "", 0), _LGR["S"])
-    _brk_my_rank = None
-    if _brk_mult > 1.0 and _me_country is not None:
-        _r_mg = c.execute("SELECT grade FROM countries WHERE name=?", (_me_country,)).fetchone()
-        _brk_my_rank = _brk_rank(get_country_league_grade(_me_country, _r_mg["grade"] if _r_mg else None))
-    _brk_grade_memo = {}
-
-    def _brk_applies(r):
-        if _brk_my_rank is None or (r["tier"] or 0) != 1:
-            return False
-        _k = r["country"]
-        if _k not in _brk_grade_memo:
-            _brk_grade_memo[_k] = _brk_rank(get_country_league_grade(r["country"], r["grade"]))
-        return _brk_grade_memo[_k] > _brk_my_rank
     from constants import O1_K_PRO as _K_PRO, O1_K_FIRST as _K_FIRST
 
     from military_service import get_military_team_ids as _mil_ids_fn
@@ -26908,8 +26912,15 @@ def _generate_offers_impl(count=5, force=False) -> list:
             else:
                 rel = "other"
             v = _K_PRO * O1_REL_BASE[rel] * _act * _fame_m * (1.0 if dom else _intl_m) * _signal_m
-            if rel in ("same_continent", "other") and _brk_applies(r):
-                v *= _brk_mult     # [2026-11-20 O1_BRK A] 다른 나라·더 높은 등급 리그의 1부 구단만(국적국·지금 리그 나라 불변)
+            if _me_level is not None:
+                _lv = _o1_level(r["country"], r["grade"], r["tier"])
+                if _lv > _me_level:                       # B: 내 리그보다 낮은 수준 — 한 단계마다 ×O1_LOWER_LEVEL_STEP_MULT
+                    # [2026-11-21] 지금 리그와 같은 나라의 하위 리그는 별도 감쇠(O1_SAME_COUNTRY_LOWER_STEP_MULT)
+                    _step = (O1_SAME_COUNTRY_LOWER_STEP_MULT if r["country"] == _me_country
+                             else O1_LOWER_LEVEL_STEP_MULT)
+                    v *= _step ** (_lv - _me_level)
+                elif rel in O1_VIS_RELS:                  # A: 같은 수준 이상 해외 구단 — 내 리그 노출도
+                    v *= _me_vis
         return min(O1_INTEREST_CAP, max(0.0, v))
 
     import hashlib as _hl
@@ -26943,10 +26954,11 @@ def _generate_offers_impl(count=5, force=False) -> list:
         if _team_below_floor(r):
             _stt["fail_floor"] += 1
             continue
-        if _team_full_fixed26(r):
+        # [2026-11-21 C] 만석 팀은 입단 후 역할이 핵심·주전일 때만 자리를 비워 제안(역할 = my_offer_role, 방출 포함).
+        _role, _ok = _offer_role_ok(r)
+        if _team_at_capacity(r) and _role not in O1_FULL_BYPASS_ROLES:
             _stt["fail_full"] += 1
             continue
-        _role, _ok = _offer_role_ok(r)
         if not _ok:
             _stt["fail_role"] += 1
             continue
@@ -27008,8 +27020,6 @@ def _generate_offers_impl(count=5, force=False) -> list:
             _stt["connected_ids"].append(_jr["id"])
             _stt["roles"][_jrole] = _stt["roles"].get(_jrole, 0) + 1
     _stt["interest_digest"] = _dig.hexdigest()
-    _stt["brk_b"], _stt["brk_mult"], _stt["brk_full_ok"], _stt["brk_full_bypass"] = (
-        round(_brk_b, 4), round(_brk_mult, 4), bool(_brk_full_ok[0]), _stt_brk[0])   # [2026-11-20 O1_BRK]
     _O1_LAST_STATS.clear()
     _O1_LAST_STATS.update(_stt)
 
@@ -27079,10 +27089,6 @@ def _generate_offers_impl(count=5, force=False) -> list:
             offers = [o for o in offers if o["team_id"] not in _blocked]
         # [2026-11-16 C] 대기·전력외 역할로는 오퍼하지 않는다(어느 경로로 뽑힌 팀이든).
         offers = [o for o in offers if o.get("role") in OFFER_ALLOWED_ROLES]
-
-    # [기능3] 이적 요청 플래그 소비 (오퍼가 생성됐으면 리셋)
-    if transfer_req and offers:
-        update_player(transfer_requested=0)
 
     # [2026-08 신설, 15-6] 오퍼 우선순위 정렬 — "좋은 오퍼가 위로" 오도록
     # 정렬한다. 원칙(신민용+GPT 합의): 여기서는 calc_effective_ovr()/
@@ -27496,7 +27502,8 @@ def _youth_apply_block(team_id, ctx, conn):
             _p_mkt, _mkt_total = p, None
         _eff = calc_effective_ovr(_p_mkt, ovr=_ovr, total_matches=_mkt_total)
         avg = {r["team_id"]: r["a"] for r in conn.execute(
-            "SELECT team_id, AVG(ovr) AS a FROM ai_players GROUP BY team_id") if r["a"] is not None}
+            "SELECT team_id, AVG(ovr) AS a FROM ai_players" + _VY.where_not_vp(conn, "team_id")
+            + " GROUP BY team_id") if r["a"] is not None}   # [2026-11-22 1단계] 가상 유스 제외
         _top = sorted(avg.values(), reverse=True)[:OFFER_FLOOR_REF_TOPN]
         _elite = (sum(_top) / len(_top)) if _top else _eff
         try:
@@ -27544,9 +27551,12 @@ def _youth_apply_block(team_id, ctx, conn):
     return None
 
 
-def calc_apply_prob_with_context(team_id, ctx):
+def calc_apply_prob_with_context(team_id, ctx, ignore_full=False):
     """get_apply_player_context()로 미리 뽑은 컨텍스트를 재사용해 팀 하나에
-    대한 확률만 계산 — 검색 결과 목록을 순회할 때 이걸 쓴다."""
+    대한 확률만 계산 — 검색 결과 목록을 순회할 때 이걸 쓴다.
+    ignore_full: [2026-11-21] 정원(26명 고정) 마감 판정을 건너뛴다 — 이미 만들어진 오퍼(_enrich_offer)의
+    협상 기준 확률용. 오퍼 생성기가 만석 예외(OFFER_STAR_FULL_BYPASS_GAP)로 자리를 비워 제안한 팀인데
+    여기서 "full"로 0%가 나와 협상 기회 1회·회당 성공 약 7%로 협상이 사실상 막혔다."""
     if ctx is None:
         return 0.0, True
     from constants import get_league_relative_margin
@@ -27582,7 +27592,7 @@ def calc_apply_prob_with_context(team_id, ctx):
     # 값 자체를 버린다) 비어있지 않은 문자열이면 기존 동작이 그대로
     # 유지되고, 라벨만 "재능 부족"과 "정원 마감"을 구분할 수 있게 된다.
     from ai_lifecycle import _is_fixed26
-    if _is_fixed26(grade, row["tier"]):
+    if not ignore_full and _is_fixed26(grade, row["tier"]):
         _n_ai = conn.execute(
             "SELECT COUNT(*) n FROM ai_players WHERE team_id=?", (team_id,)).fetchone()["n"]
         if _n_ai >= 26:
@@ -27864,6 +27874,11 @@ def direct_apply_view(team_id, ctx, p=None):
     _ab = _my_age_apply_block(team_id, ctx, p)
     if _ab:
         return 0.0, _ab
+    # [2026-11-21 신설, 신민용 요청: "유스팀은 가장 아래부터 신청 가능한 원리"] 한 구단의 산하팀이 여럿이면(카스티야·C 등)
+    # 그중 가장 낮은 리그 팀만 직접 지원 가능 — 위 산하팀은 아래에서 올라가는 경로(C→카스티야). 오퍼 협상 공용 함수는 그대로.
+    _lb = _youth_lowest_apply_block(team_id, ctx)
+    if _lb:
+        return 0.0, _lb
     prob, blocked = calc_apply_prob_with_context(team_id, ctx)
     from constants import DIRECT_APPLY_HARDER, DIRECT_APPLY_CAP
     if not DIRECT_APPLY_HARDER:
@@ -27874,6 +27889,27 @@ def direct_apply_view(team_id, ctx, p=None):
     if sc >= 1.0:
         return prob, blocked          # 커리어 중 FA — 기존 확률 그대로
     return min(DIRECT_APPLY_CAP, prob * sc), blocked
+
+
+def _youth_lowest_apply_block(team_id, ctx=None):
+    """[2026-11-21 신설] 산하팀 직접 지원은 같은 모구단 산하팀 중 가장 낮은 리그(부수가 가장 큰) 팀만 — 같은 부수면 모두 허용.
+    반환: None(산하팀 아님·통과) 또는 "youth_lower". 판정표는 ctx에 한 번만 만들어 검색 목록에서 재사용한다."""
+    low = ctx.get("_youth_lowest") if ctx is not None else None
+    if low is None:
+        conn = get_conn()
+        try:
+            rows = conn.execute(
+                """SELECT t.id, t.parent_team_id AS pid, l.tier FROM teams t JOIN leagues l ON l.id=t.league_id
+                   WHERE t.classification_status='AFFILIATE' AND t.parent_team_id>0""").fetchall()
+        finally:
+            conn.close()
+        bottom = {}
+        for r in rows:
+            bottom[r["pid"]] = max(bottom.get(r["pid"], 0), r["tier"] or 0)
+        low = {r["id"]: (r["tier"] or 0) >= bottom[r["pid"]] for r in rows}
+        if ctx is not None:
+            ctx["_youth_lowest"] = low
+    return None if low.get(team_id, True) else "youth_lower"
 
 
 def direct_apply_scale(ctx=None):
@@ -27930,7 +27966,7 @@ def apply_to_team(team_id):
     # 일이 없어야 한다). 재능 미달은 기존 동작(시도 소모 + 0.5% 도박)을
     # 그대로 유지한다 — 그건 "확률이 아주 낮다"는 설계였다.
     if blocked in ("full", "youth_age", "youth", "applied",
-                   "age_min", "age_foreign"):   # [2026-11-18] 유스 자격 미달·같은 구단 재지원도 / [2026-11-19] 16세 미만 나이 규칙도 시도 소모 없이 거절
+                   "age_min", "age_foreign", "youth_lower"):   # [2026-11-18] 유스 자격 미달·같은 구단 재지원도 / [2026-11-19] 16세 미만 나이 규칙도 시도 소모 없이 거절
         return False, 0.0, None
     from constants import DIRECT_APPLY_HARDER as _DAH
     if _DAH:
@@ -28342,6 +28378,11 @@ def _enrich_offer(o: dict, row, join_prob=None) -> dict:
     if join_prob is None:
         try:
             join_prob, _blocked = calc_apply_success_prob(row["id"])
+            # [2026-11-21 버그수정, 신민용 리포트: "오퍼 올 때 금액 협상이 아예 안 된다"] 오퍼가 이미 나왔다 =
+            # 구단이 자리를 비워서라도 원한다(만석 예외). 정원 마감 0%를 협상 기준으로 쓰지 않는다.
+            if _blocked == "full":
+                join_prob, _blocked = calc_apply_prob_with_context(row["id"], get_apply_player_context(),
+                                                                   ignore_full=True)
         except Exception:
             join_prob = None
     o["join_prob"] = join_prob
@@ -29027,8 +29068,9 @@ def _my_team_importance_ratio(p, conn=None) -> float:
     return max(0.1, min(1.0, appearance_ratio + rating_bonus + position_bonus))
 
 
-def evaluate_offer_decision(p, offer, competing_offer_count=1):
+def evaluate_offer_decision(p, offer, competing_offer_count=1, request_mult=1.0):
     """오퍼 하나를 받았을 때 원 소속 구단의 판단을 3단계로 계산한다.
+    request_mult: [2026-11-21] 이적 요청 재평가 때만 1 미만(최소 요구액 배율) — 기본 1.0이면 예전과 같다.
     반환: (decision, detail_dict)
       decision: "forced_sale" | "accept" | "reject"
     """
@@ -29050,6 +29092,13 @@ def evaluate_offer_decision(p, offer, competing_offer_count=1):
     importance = _my_team_importance_ratio(p)
     extra_pct = _min_accept_extra_pct(p, offer, importance, competing_offer_count, cur_year)
     min_accept_mult = max(0.75, min(1.60, 1.0 + extra_pct))
+    # [2026-11-20 신설, 신민용+GPT 확정] 같은 구단 3시즌 안 두 번째 이적 요청 → 보유 의향 재평가(요청 시즌
+    # +다음 시즌): 최소 요구액 ×TRANSFER_REQ_REEVAL_MIN_ACCEPT_MULT(0.95). 위 clamp 뒤에 곱한다(이미 하한 0.75인 경우에도 효과가 남게).
+    if transfer_request_reeval_active(p, cur_year):
+        from constants import TRANSFER_REQ_REEVAL_MIN_ACCEPT_MULT
+        min_accept_mult *= TRANSFER_REQ_REEVAL_MIN_ACCEPT_MULT
+    if request_mult != 1.0:
+        min_accept_mult *= request_mult
     min_accept = base_fee * min_accept_mult
     if offer_fee >= min_accept:
         return "accept", {"min_accept_mult": min_accept_mult, "base_fee": base_fee}
@@ -29544,6 +29593,7 @@ def _offer_sale_gate(p, offer):
             f"{fmt_money(offer.get('transfer_fee',0))} "
             f"< 최소 요구 {fmt_money(int(detail['base_fee']*detail['min_accept_mult']))})",
             "news")
+        _store_refused_offer(offer, int(detail['base_fee'] * detail['min_accept_mult']))
         return False
     elif decision == "forced_sale":
         add_log(
@@ -29823,36 +29873,363 @@ def join_team(team_id, salary, transfer_type: str = "입단", offer: dict = None
     _sync_teams_from_results(row["lid"], st["current_season"])
 
 
+def _store_refused_offer(offer, min_accept=0):
+    """[2026-11-21 신설, 신민용 확정 — 이적 요청 재설계] 원 소속 구단이 판매를 거절한 오퍼를 이적 요청 대상으로 남긴다
+    (club_sale_intent_json["refused"]). 오퍼 창 안에서 거절된 경우만 — 창 밖(옛 예약의 이동 주차 판정 등)은 남기지 않는다.
+    같은 창에서 다른 오퍼가 또 거절되면 마지막 거절 오퍼로 바뀐다(요청은 1건만)."""
+    try:
+        p = get_player() or {}
+        wkey = _current_offer_window_key()
+        if not wkey or not p.get("current_team_id"):
+            return
+        o = json.loads(json.dumps(offer or {}, ensure_ascii=False, default=str))
+        for k in ("_sale_gate_ok", "_sale_gate_from", "_transfer_request_ok"):
+            o.pop(k, None)
+        d = _club_sale_intent(p)
+        d["refused"] = {"window": wkey, "from_tid": int(p.get("current_team_id") or 0),
+                        "team_id": int(o.get("team_id") or 0), "requested": False, "offer": o,
+                        "min_accept": int(min_accept or 0), "result": ""}
+        _save_club_sale_intent(d)
+    except Exception as e:
+        print(f"[TRANSFER-REQ] 거절 오퍼 기록 실패(이적 요청 불가로 둠): {e}")
+
+
+def refused_offer_for_request(p=None):
+    """[2026-11-21] 지금 이적 요청할 수 있는 거절 오퍼 기록(dict) — 같은 오퍼 창·같은 소속팀일 때만, 아니면 None."""
+    p = p or get_player() or {}
+    r = _club_sale_intent(p).get("refused") or {}
+    if not r or not r.get("offer"):
+        return None
+    if r.get("window") != _current_offer_window_key():
+        return None
+    if int(r.get("from_tid") or 0) != int(p.get("current_team_id") or 0):
+        return None
+    return r
+
+
+def transfer_request_block_reason(p=None):
+    """[2026-11-21] 이적 요청 창 자체를 쓸 수 없는 상태의 사유(없으면 "") — 무소속·복무·임대 중·판매 예약 중.
+    메인 화면 버튼은 이 사유가 없으면 켜지고(임대 버튼처럼 창에서 상태를 보여준다), 제출 가능 여부는 transfer_request_state."""
+    p = p or get_player() or {}
+    if not p.get("current_team_id"):
+        return "소속팀이 있을 때만 이적을 요청할 수 있습니다."
+    try:
+        import my_loan as _ml
+        _st = _ml.status(p)
+    except Exception:
+        _st = {}
+    if _st.get("serving"):
+        return "복무 중에는 이적을 요청할 수 없습니다."
+    if _st.get("on_loan") or _st.get("pending"):
+        return "임대 중(또는 임대 예약 중)에는 이적을 요청할 수 없습니다."
+    if p.get("pending_sale_transfer_json"):
+        return "구단 판매 추진 이적이 이미 예약돼 있습니다."
+    return ""
+
+
+def transfer_request_status(p=None) -> dict:
+    """[2026-11-21] 이적 요청 창(ui/transfer_request_window)이 보여줄 상태 — UI와 엔진 판정 일치용.
+    반환: {"block_reason": str, "refused": 이번 오퍼 창의 거절 오퍼 기록 또는 None, "can_submit": bool, "reason": str}
+    refused["result"]: "" 아직 요청 안 함 / "approved" 구단 승인 / "denied" 구단 거절."""
+    p = p or get_player() or {}
+    br = transfer_request_block_reason(p)
+    r = None if br else refused_offer_for_request(p)
+    ok, why = transfer_request_state(p)
+    return {"block_reason": br, "refused": r, "can_submit": ok, "reason": "" if ok else why}
+
+
+def transfer_request_state(p=None):
+    """[2026-11-21 재설계, 신민용 확정] 이적 요청을 낼 수 있나(누를 수 있나, 사유). 내가 수락한 오퍼를 원 소속
+    구단이 거절했을 때만 — 그 오퍼 1건에 1번, 같은 오퍼 창 안에서만. 복무·임대 중·판매 예약 중엔 불가."""
+    p = p or get_player() or {}
+    if not p.get("current_team_id"):
+        return False, "소속팀이 있을 때만 이적을 요청할 수 있습니다."
+    try:
+        import my_loan as _ml
+        _st = _ml.status(p)
+    except Exception:
+        _st = {}
+    if _st.get("serving"):
+        return False, "복무 중에는 이적을 요청할 수 없습니다."
+    if _st.get("on_loan") or _st.get("pending"):
+        return False, "임대 중(또는 임대 예약 중)에는 이적을 요청할 수 없습니다."
+    if p.get("pending_sale_transfer_json"):
+        return False, "구단 판매 추진 이적이 이미 예약돼 있습니다."
+    r = refused_offer_for_request(p)
+    if not r:
+        return False, "수락한 오퍼를 구단이 거절했을 때만 이적을 요청할 수 있습니다(같은 오퍼 창 안)."
+    if r.get("requested"):
+        return False, f"{r['offer'].get('team_name', '그 구단')} 오퍼에 대해 이미 이적을 요청했습니다."
+    return True, ""
+
+
 def request_transfer() -> dict:
-    """[기능3] 이적 요청. 감독관계 하락을 감수하고 다음 오퍼 창을 활성화.
-
-    반환 dict (UI/추후 Godot 공용):
-      {"ok": bool, "msg": str, "manager_relation": int}
-    """
-    from constants import TRANSFER_REQUEST_REL_PENALTY
+    """[2026-11-21 재설계, 신민용 확정] 이적 요청 — 구단이 거절한 그 오퍼(금액·조건 그대로)를 구단이 다시 판정한다.
+    감독 관계 −TRANSFER_REQUEST_REL_PENALTY, 최소 요구액 ×(비핵심 0.95 / 핵심 0.98), 같은 구단 3시즌 안 두 번째 요청이면
+    기존 재평가 ×0.95가 추가로 곱해진다. 승인 → 그 오퍼로 이적 예약, 거절 → 잔류. 반환 dict (UI/추후 Godot 공용):
+      {"ok": bool, "approved": bool, "msg": str, "manager_relation": int}"""
+    from constants import (TRANSFER_REQUEST_REL_PENALTY, TRANSFER_REQ_MULT_NONCORE, TRANSFER_REQ_MULT_CORE,
+                           TRANSFER_REQ_CORE_IMPORTANCE)
     p = get_player()
-    if not p or not p.get("current_team_id"):
-        return {"ok": False, "msg": "소속팀이 없습니다.", "manager_relation": 0}
-    if p.get("transfer_requested"):
-        return {"ok": False, "msg": "이미 이적을 요청한 상태입니다.",
-                "manager_relation": p.get("manager_relation", 50)}
+    if not p:
+        return {"ok": False, "approved": False, "msg": "선수 정보가 없습니다.", "manager_relation": 0}
+    _ok, _why = transfer_request_state(p)
+    if not _ok:
+        return {"ok": False, "approved": False, "msg": _why, "manager_relation": p.get("manager_relation", 50)}
+    r = refused_offer_for_request(p)
+    offer = dict(r["offer"])
+    _tname = offer.get("team_name", "")
 
-    # [2026-09 신설, 신민용 확정] 성격 "은둔형" — 이적 요청은 플레이어가
-    # 직접 누르는 행동이라 원래 설계("이적요청 확률도 낮음")의 '확률'을
-    # 낮출 대상이 없다. 대신 "잡음 없이 조용히"라는 취지를 살려, 실제로
-    # 요청했을 때 감독관계 악화폭을 transfer_rel_penalty_mult만큼
-    # 줄여준다(저마찰로 처리).
+    # 같은 오퍼에 1번 — 판정 전에 먼저 표시한다(도중 예외가 나도 재요청 불가).
+    d = _club_sale_intent(p)
+    d["refused"]["requested"] = True
+    _save_club_sale_intent(d)
+
+    # [2026-09 신설, 신민용 확정] 성격 "은둔형" — 감독 관계 악화폭을 transfer_rel_penalty_mult만큼 줄인다.
     _pe_req = PERSONALITY_EFFECTS.get(p.get("personality", ""), {})
     _req_penalty = TRANSFER_REQUEST_REL_PENALTY
     if "transfer_rel_penalty_mult" in _pe_req:
         _req_penalty = round(_req_penalty * _pe_req["transfer_rel_penalty_mult"])
     rel = max(0, p.get("manager_relation", 50) - _req_penalty)
-    update_player(manager_relation=rel, transfer_requested=1)
-    add_log(f"📣 이적 요청! 감독과의 관계가 악화됐다. (관계 {rel})", "event")
-    return {"ok": True,
-            "msg": f"이적을 요청했습니다. 다음 이적시장에서 더 많은 오퍼가 들어옵니다.\n"
-                   f"감독 관계가 {_req_penalty} 하락했습니다.",
-            "manager_relation": rel}
+    update_player(manager_relation=rel)
+    add_log(f"📣 이적 요청 — {_tname} 이적을 공식 요청했습니다. 감독과의 관계가 악화됐다. (관계 {rel})", "event")
+    # 같은 구단 3시즌 안 두 번째 요청이면 보유 의향 재평가(×0.95)가 켜진다 — 아래 재판정에 바로 반영된다.
+    _st_rq = get_state() or {}
+    _cy = int(_st_rq.get("current_year") or p.get("current_year") or 0)
+    _until = _note_transfer_request(get_player() or p, _cy)
+    if _until:
+        add_log(f"📋 구단이 당신의 보유 의향을 재평가합니다 — 반복된 이적 요청으로 {_until}년까지 "
+                f"이적 제안을 받아들이는 문턱이 낮아집니다.", "event")
+
+    p2 = get_player() or p
+    _imp = _my_team_importance_ratio(p2)
+    _core = _imp >= TRANSFER_REQ_CORE_IMPORTANCE
+    _mult = TRANSFER_REQ_MULT_CORE if _core else TRANSFER_REQ_MULT_NONCORE
+    decision, detail = evaluate_offer_decision(p2, offer, competing_offer_count=offer.get("competing_offer_count", 1),
+                                               request_mult=_mult)
+    _msg_pen = f"감독 관계가 {_req_penalty} 하락했습니다."
+    try:   # 결과를 기록해 이적 요청 창이 그 오퍼 창 동안 결과를 보여준다
+        _d2 = _club_sale_intent(get_player() or p2)
+        if _d2.get("refused"):
+            _d2["refused"]["result"] = "denied" if decision == "reject" else "approved"
+            _d2["refused"]["min_accept_after"] = int(detail["base_fee"] * detail["min_accept_mult"])
+            _save_club_sale_intent(_d2)
+    except Exception as _e:
+        print(f"[TRANSFER-REQ] 결과 기록 실패: {_e}")
+    if decision == "reject":
+        add_log(f"🚫 구단이 이적 요청을 받아들이지 않았습니다 — {_tname} 이적 불가, 현 소속팀에 남습니다. "
+                f"(제안 {fmt_money(offer.get('transfer_fee', 0))} < 최소 요구 "
+                f"{fmt_money(int(detail['base_fee'] * detail['min_accept_mult']))})", "news")
+        return {"ok": True, "approved": False, "manager_relation": rel,
+                "msg": f"구단이 이적 요청을 거절했습니다. 현 소속팀에 남습니다.\n{_msg_pen}"}
+    add_log(f"🤝 구단이 이적 요청을 받아들여 {_tname}의 제안({fmt_money(offer.get('transfer_fee', 0))})에 "
+            f"매각을 승인했습니다.", "news")
+    _reset_offer_rejection()
+    offer["_transfer_request_ok"] = True
+    _res = reserve_join_transfer(offer.get("team_id"), offer.get("salary", 0), _tname, transfer_type="오퍼", offer=offer)
+    if _res is False:
+        return {"ok": True, "approved": True, "manager_relation": rel,
+                "msg": f"구단은 승인했지만 이적을 예약할 수 없었습니다(입단한 이적 기간 등).\n{_msg_pen}"}
+    return {"ok": True, "approved": True, "manager_relation": rel,
+            "msg": f"구단이 이적 요청을 받아들였습니다 — {_tname} 이적이 예약됐습니다.\n{_msg_pen}"}
+
+
+# ── [2026-11-20 신설, 신민용+GPT 확정] 구단 매각 의향: 이적 요청 재평가 · 고가 매각 검토 ──────────
+# 판매 추진(_calc_sale_push_score — 구단이 정리하려고 압박하는 시스템)과 완전히 분리된 두 장치.
+#   ① 이적 요청 재평가: 같은 구단에서 3시즌 안 두 번째 요청 → 요청 시즌+다음 시즌 동안 오퍼 승인 최소
+#      요구액 ×0.95, 고가 매각 기준 ×0.9(constants 값). 판매 점수·거절 카운터는 건드리지 않는다.
+#   ② 고가 매각 검토: 이적 창에 AI 구단 오퍼가 오면(기존 오퍼 생성 그대로 — 새 오퍼를 만들지 않음) 그중
+#      구단이 먼저 팔고 싶어질 만큼 큰 금액이 있으면 구단이 매각 의사를 묻는다. 거절 불이익 0, 창당 1회.
+# 기록은 my_player.club_sale_intent_json 한 칸(JSON)에 둔다 — {"req", "reeval", "hv_window"}.
+def _club_sale_intent(p):
+    try:
+        d = json.loads((p or {}).get("club_sale_intent_json") or "{}")
+    except Exception:
+        d = {}
+    return d if isinstance(d, dict) else {}
+
+
+def _save_club_sale_intent(d):
+    update_player(club_sale_intent_json=json.dumps(d, ensure_ascii=False))
+
+
+def _note_transfer_request(p, cur_year):
+    """이적 요청 1건을 기록한다. 같은 구단 요청이 3시즌 안에 2건째면 재평가를 켜고 그 마지막 연도를,
+    아니면 0을 돌려준다. 다른 구단에서 한 요청·3시즌 지난 요청은 기록에서 지운다(이적하면 자연히 초기화)."""
+    from constants import (TRANSFER_REQ_REEVAL_ENABLED, TRANSFER_REQ_REEVAL_WINDOW_YEARS,
+                           TRANSFER_REQ_REEVAL_MIN_COUNT, TRANSFER_REQ_REEVAL_SEASONS)
+    tid = int((p or {}).get("current_team_id") or 0)
+    if not tid or not cur_year:
+        return 0
+    d = _club_sale_intent(p)
+    lo = cur_year - (TRANSFER_REQ_REEVAL_WINDOW_YEARS - 1)
+    req = []
+    for it in d.get("req") or []:
+        try:
+            y, t = int(it[0]), int(it[1])
+        except Exception:
+            continue
+        if t == tid and y >= lo:
+            req.append([y, t])
+    req.append([int(cur_year), tid])
+    d["req"] = req
+    until = 0
+    if TRANSFER_REQ_REEVAL_ENABLED and len(req) >= TRANSFER_REQ_REEVAL_MIN_COUNT:
+        until = int(cur_year) + TRANSFER_REQ_REEVAL_SEASONS - 1
+        d["reeval"] = {"tid": tid, "since": int(cur_year), "until": until}
+    _save_club_sale_intent(d)
+    return until
+
+
+def transfer_request_reeval_active(p, cur_year=None) -> bool:
+    """보유 의향 재평가가 지금 소속 구단에 적용 중인가(요청 시즌~다음 시즌, 같은 구단일 때만)."""
+    from constants import TRANSFER_REQ_REEVAL_ENABLED
+    if not TRANSFER_REQ_REEVAL_ENABLED or not p:
+        return False
+    tid = int(p.get("current_team_id") or 0)
+    if not tid:
+        return False
+    r = _club_sale_intent(p).get("reeval") or {}
+    if cur_year is None:
+        cur_year = p.get("current_year") or (get_state() or {}).get("current_year") or 0
+    try:
+        return int(r.get("tid") or 0) == tid and int(cur_year) <= int(r.get("until") or 0)
+    except Exception:
+        return False
+
+
+def high_value_sale_threshold(p, offer, cur_year=None, rank_cat=None):
+    """고가 매각 기준 배수(기준 이적료 _base_fee 대비)와 내역. 반환: (배수, detail).
+    기본 = 강제 판매 기본 배수(내 리그 등급) × HV_SALE_BASE_RATIO. 보정 곱은 HV_SALE_CLAMP로 제한하고,
+    마지막에 HV_SALE_MIN_FEE_RATIO(시장가 이상) 바닥을 건다.
+    [2026-11-20] 내 리그 등급이 하위(HV_SALE_LOW_LEAGUE_GRADES)면 기본 배수에 HV_SALE_MOD_LOW_LEAGUE를 더 곱한다
+    (보정 곱·범위 제한과 별개 — 리그 기본값 조정)."""
+    from constants import (HV_SALE_BASE_RATIO, HV_SALE_MOD_BUYER_GAP2, HV_SALE_MOD_BIG_CLUB,
+                           HV_SALE_MOD_CONTRACT_SHORT, HV_SALE_MOD_CONTRACT_LONG, HV_SALE_MOD_AGE29,
+                           HV_SALE_MOD_ACE, HV_SALE_MOD_CORE, HV_SALE_CLAMP, HV_SALE_MIN_FEE_RATIO,
+                           HV_SALE_LOW_LEAGUE_GRADES, HV_SALE_MOD_LOW_LEAGUE,
+                           TRANSFER_REQ_REEVAL_HV_MULT)
+    from economy import FORCED_SALE_BASE_MULT
+    if cur_year is None:
+        cur_year = p.get("current_year") or (get_state() or {}).get("current_year") or 0
+    my_grade = offer.get("my_grade", "C")
+    buyer_grade = offer.get("grade", "C")
+    base_mult = FORCED_SALE_BASE_MULT.get(my_grade, 2.0) * HV_SALE_BASE_RATIO
+    if my_grade in HV_SALE_LOW_LEAGUE_GRADES:
+        base_mult *= HV_SALE_MOD_LOW_LEAGUE
+    mods = []
+    gap = LEAGUE_GRADE_RANK.get(buyer_grade, 4) - LEAGUE_GRADE_RANK.get(my_grade, 4)
+    if gap >= 2:
+        mods.append(("buyer_gap2", HV_SALE_MOD_BUYER_GAP2))
+    if my_grade in ("SS", "S"):
+        mods.append(("big_club", HV_SALE_MOD_BIG_CLUB))
+    _ce = p.get("contract_end_year") or 0
+    remain = (_ce - int(cur_year)) if (_ce and cur_year) else None
+    if remain is not None:
+        if remain <= 1:
+            mods.append(("contract_short", HV_SALE_MOD_CONTRACT_SHORT))
+        elif remain >= 4:
+            mods.append(("contract_long", HV_SALE_MOD_CONTRACT_LONG))
+    if (p.get("age") or 0) >= 29:
+        mods.append(("age29", HV_SALE_MOD_AGE29))
+    if rank_cat is None:
+        rank_cat = _my_team_rank_category(p)
+    if rank_cat == "에이스":
+        mods.append(("ace", HV_SALE_MOD_ACE))
+    elif rank_cat == "핵심":
+        mods.append(("core", HV_SALE_MOD_CORE))
+    if transfer_request_reeval_active(p, cur_year):
+        mods.append(("request_reeval", TRANSFER_REQ_REEVAL_HV_MULT))
+    factor = 1.0
+    for _k, _m in mods:
+        factor *= _m
+    factor_c = max(HV_SALE_CLAMP[0], min(HV_SALE_CLAMP[1], factor))
+    mult = max(HV_SALE_MIN_FEE_RATIO, base_mult * factor_c)
+    return mult, {"base_mult": base_mult, "factor": factor, "factor_clamped": factor_c,
+                  "mods": [k for k, _m in mods], "gap": gap, "my_grade": my_grade,
+                  "buyer_grade": buyer_grade, "rank_cat": rank_cat}
+
+
+def _high_value_sale_block_reason(p):
+    """고가 매각을 묻지 않는 상태(다른 판매·임대·이적 절차 진행 중, 16세 미만, 복무 중, 임대 중). 없으면 ""."""
+    if not p or not p.get("current_team_id"):
+        return "no_team"
+    if p.get("loan_from_team_id"):
+        return "on_loan"
+    if _my_is_serving(p):
+        return "serving"
+    if my_under_adult_age(p):
+        return "under16"
+    if p.get("sale_push_proposal_json"):
+        return "sale_push_pending"      # 기존 판매 추진(정리 목적) 제안이 우선
+    if p.get("pending_join_transfer_json") or p.get("pending_sale_transfer_json"):
+        return "transfer_pending"
+    import my_loan as _my_loan
+    if _my_loan.loan_push_active(p):
+        return "loan_pending"
+    _w = _my_loan._loads(p.get("loan_wish_json")) or {}
+    if _w.get("status") in ("submitted", "approved"):
+        return "loan_wish"
+    return ""
+
+
+def pick_high_value_sale(offers):
+    """이번 이적 창에 생성된 오퍼(generate_offers 결과) 중 구단이 매각 의사를 물을 오퍼를 고른다.
+    조건을 넘는 오퍼가 여럿이면 이적료가 가장 큰 것. 고르면 이 창을 "물어봄"으로 기록하고(창당 1회)
+    표시용 내역(_hv)을 붙인 사본을 돌려준다. 없으면 None. 오퍼 목록 자체는 바꾸지 않는다."""
+    from constants import HV_SALE_ENABLED
+    if not HV_SALE_ENABLED or not offers:
+        return None
+    p = get_player()
+    if not p or _high_value_sale_block_reason(p):
+        return None
+    st = get_state() or {}
+    cy, cw = int(st.get("current_year") or 0), int(st.get("current_week") or 0)
+    wkey = offer_window_key(cy, cw)
+    if not wkey:
+        return None
+    d = _club_sale_intent(p)
+    if d.get("hv_window") == wkey:
+        return None
+    rank_cat = _my_team_rank_category(p)
+    best = None
+    for o in offers:
+        fee = int(o.get("transfer_fee") or 0)
+        base = int(o.get("_base_fee") or 0)
+        if fee <= 0 or base <= 0:
+            continue
+        mult, det = high_value_sale_threshold(p, o, cy, rank_cat=rank_cat)
+        if fee >= base * mult and (best is None or fee > best[0]):
+            best = (fee, o, mult, det, base)
+    if best is None:
+        return None
+    fee, o, mult, det, base = best
+    d["hv_window"] = wkey
+    _save_club_sale_intent(d)
+    hv = dict(o)
+    hv["_hv"] = dict(det, mult=round(mult, 3), ratio=round(fee / base, 3), window=wkey)
+    return hv
+
+
+def accept_high_value_sale(offer):
+    """고가 매각 제안 수락 — 구단은 이미 매각에 동의했으므로 판매 승인 게이트 없이 일반 오퍼처럼 이적을
+    예약한다(다음 이동 시점에 실제 이적). 반환 True = 예약됨."""
+    o = dict(offer or {})
+    o.pop("_hv", None)
+    o["_high_value_sale"] = True
+    r = reserve_join_transfer(o["team_id"], o.get("salary", 0), o.get("team_name", ""),
+                              transfer_type="오퍼", offer=o)
+    return r is not False
+
+
+def reject_high_value_sale(offer):
+    """고가 매각 제안 거절 — 불이익 없음(판매 점수·압박·감독 관계·쿨다운 모두 그대로). 같은 창에선 다시
+    묻지 않는다(창 기록은 pick_high_value_sale에서 이미 남김). 오퍼 창의 같은 오퍼는 그대로 고를 수 있다."""
+    st = get_state() or {}
+    add_log(f"🙅 {offer.get('team_name', '')}의 이적 제안에 대한 구단 매각 제안을 거절했습니다 — "
+            f"구단은 결정을 존중하며 불이익은 없습니다.", "event",
+            st.get("current_year"), st.get("current_week"))
+    return True
 
 
 def negotiate_renewal() -> dict:

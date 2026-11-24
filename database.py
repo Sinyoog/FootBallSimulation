@@ -1309,8 +1309,8 @@ def _migrate_managers():
                LEFT JOIN countries c ON c.id = t.country_id
                LEFT JOIN leagues lg ON lg.id = t.league_id
                WHERE NOT EXISTS (SELECT 1 FROM team_managers tm
-                                 WHERE tm.team_id = t.id AND tm.end_year IS NULL)
-               ORDER BY t.id""").fetchall()
+                                 WHERE tm.team_id = t.id AND tm.end_year IS NULL)""" + _VY_and_not_vt(conn)
+            + " ORDER BY t.id").fetchall()   # [2026-11-22 1단계] 가상 유스 팀엔 감독 없음
         if not todo:
             return 0
 
@@ -2203,6 +2203,16 @@ _HIST_TRANSITION_WRITES_CURRENT_YEAR = frozenset({
 })
 
 
+# [2026-11-22] 기록 화면 통산 장부(record_ledger)의 원본 표 — 아래 복구가 이 표의 행을 지우면 장부도 무효로 보고
+# 불러오기 끝(init_db → record_ledger.ensure_valid)에 기록 표에서 다시 만든다(이미 더한 시즌이 지워졌으므로).
+_RECORD_LEDGER_SOURCES = ("ai_player_season_stats", "ai_player_season_stats_by_comp", "ai_player_season_team_stats")
+
+
+def _record_ledger_mark_dirty():
+    import record_ledger
+    record_ledger.mark_dirty()
+
+
 def _repair_future_hist_data(conn):
     """load_from_disk() 직후(=main이 막 복원된 시점) 매번 호출된다. main의
     season_state.current_year보다 같거나 큰 연도의 hist 기록은 main 기준
@@ -2289,6 +2299,8 @@ def _repair_future_hist_data(conn):
             cur = conn.execute(f"DELETE FROM hist.{tbl} WHERE year {_op} ?", (cutoff_year,))
             if cur.rowcount:
                 removed_any = True
+                if tbl in _RECORD_LEDGER_SOURCES:
+                    _record_ledger_mark_dirty()
                 print(f"[HIST-REPAIR] hist.{tbl}: year{_op}{cutoff_year} {cur.rowcount}행 삭제"
                       f"(main/hist 시점 불일치 복구 — load_from_disk 참고)")
             if _past_snap:
@@ -2317,6 +2329,8 @@ def _repair_future_hist_data(conn):
                         (cutoff_year,))
                 if _extra is not None and _extra.rowcount:
                     removed_any = True
+                    if tbl in _RECORD_LEDGER_SOURCES:
+                        _record_ledger_mark_dirty()
                     print(f"[HIST-REPAIR] hist.{tbl}: {cutoff_year}년 연도전환분 {_extra.rowcount}행 삭제"
                           f"(전환 도중 종료된 판의 기록 — 43주차 스냅샷분은 보존)")
         except sqlite3.OperationalError:
@@ -2679,6 +2693,70 @@ def _history_log(msg):
         pass
 
 
+# ── [2026-11-22 신설, 신민용 승인] 뒤쪽(낮은 우선순위) 기록 작업 ───────────────────────────────────
+# 기록 화면 통산 장부(record_ledger)처럼 게임이 다시 읽지 않는 쓰기는 위 FIFO 큐에 넣지 않는다 — 넣으면 게임이
+# 기록 표를 읽기 직전 동기화(history_sync_for_read)가 그것까지 기다린다(실측: 43주 스냅샷 직후 국가대표 선발 동기화가
+# 장부 합산 약 4.5초를 그대로 기다림). 같은 쓰기 스레드가 FIFO 큐가 비어 있을 때만 한 단계씩(짧은 트랜잭션 하나)
+# 처리하고, 게임 기록 작업이 들어오면 그 단계가 끝나는 대로 게임 작업을 먼저 한다. 그래서:
+#   · 게임 쪽 동기화(history_drain(main_only=True))는 뒤쪽 작업을 기다리지 않는다 — 기다려도 한 단계(짧다)뿐.
+#   · 저장·종료·새 게임(history_drain() 기본값)은 뒤쪽 작업까지 다 끝난 뒤에 main을 저장한다 — "main이 기록 DB보다
+#     앞서지 않는다"(불변식 5)가 장부에도 그대로 성립한다.
+#   · 쓰기 스레드는 하나뿐이라 두 작업이 같은 파일을 동시에 쓰는 일은 없다. 게임 결과(표 내용·난수)는 이 작업과
+#     무관하다 — 게임 로직은 장부 표를 읽지 않는다.
+# 작업 = (kind, rows) → 쓰기 스레드가 _HISTORY_BG_JOB_FACTORY[kind](conn, rows) 생성기를 만들어 next()마다 커밋.
+import collections as _collections
+
+_HISTORY_WAKE = "__wake__"
+_history_bg_jobs = _collections.deque()   # [kind, rows, 생성기 또는 None]
+_history_bg_idle = threading.Event()
+_history_bg_idle.set()
+HISTORY_BG_WAIT_STATS = {"waits": 0, "seconds": 0.0, "callers": [], "main_join_during_bg": 0, "main_join_during_bg_s": 0.0}   # 진단용 — 저장 등이 뒤쪽 작업을 실제로 기다린 횟수·시간
+
+
+def _history_bg_factory(kind):
+    if kind == "record_ledger":
+        import record_ledger
+        return record_ledger.bg_job
+    raise ValueError(f"알 수 없는 뒤쪽 기록 작업: {kind!r}")
+
+
+def _history_bg_step(conn):
+    """쓰기 스레드 전용 — 맨 앞 뒤쪽 작업을 한 단계 진행하고 커밋. 실패하면 그 작업만 버린다(롤백) —
+    장부에 남은 진행 중 표시가 다음 불러오기 때 재구축을 일으킨다(record_ledger.ensure_valid)."""
+    job = _history_bg_jobs[0]
+    try:
+        if job[2] is None:
+            job[2] = _history_bg_factory(job[0])(conn, job[1])
+        try:
+            next(job[2])
+            conn.commit()
+            return
+        except StopIteration:
+            conn.commit()
+    except Exception as e:
+        _history_log(f"[HIST-WORKER] 뒤쪽 작업 {job[0]} 실패(이 작업만 건너뜀): {e!r}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    _history_bg_jobs.popleft()
+    if not _history_bg_jobs:
+        _history_bg_idle.set()
+
+
+def history_enqueue_background(kind, rows):
+    """뒤쪽 기록 작업 추가(위 주석) — 즉시 반환. rows는 이 순간 내용으로 고정한다."""
+    _history_bg_factory(kind)   # 알 수 없는 kind면 여기서 바로 알린다
+    _history_bg_idle.clear()
+    _history_bg_jobs.append([kind, tuple(rows), None])
+    global _history_pending, _history_max_pending_seen
+    with _history_metrics_lock:
+        _history_pending += 1
+        _history_max_pending_seen = max(_history_max_pending_seen, _history_pending)
+    _ensure_history_worker_started()
+    _history_queue.put(HistoryTask(0, _HISTORY_WAKE, ()))   # 큐에서 잠든 쓰기 스레드를 깨운다
+
+
 def _history_worker_loop():
     global _history_worker_error, _history_worker_dead, _history_last_completed_seq, _history_pending
     conn = sqlite3.connect(_history_db_path(), timeout=30)
@@ -2688,7 +2766,15 @@ def _history_worker_loop():
         pass
     try:
         while True:
-            task = _history_queue.get()
+            if _history_bg_jobs and not _history_worker_dead:
+                # [2026-11-22] 뒤쪽(낮은 우선순위) 작업 — 게임 기록 작업이 없을 때만 한 단계씩(아래 주석)
+                try:
+                    task = _history_queue.get_nowait()
+                except _queue.Empty:
+                    _history_bg_step(conn)
+                    continue
+            else:
+                task = _history_queue.get()
             try:
                 if task is None:   # shutdown 신호(현재 미사용, 확장 대비)
                     break
@@ -2698,6 +2784,8 @@ def _history_worker_loop():
                     # history_drain()이 이 상태를 알려준다 — 불변식 6).
                     continue
                 try:
+                    if task.kind == _HISTORY_WAKE:
+                        continue   # 뒤쪽 작업 깨우기 신호(아래 history_enqueue_background) — 할 일 없음
                     sql = _HISTORY_TASK_SQL[task.kind]
                     if task.rows:
                         conn.executemany(sql, task.rows)
@@ -2755,7 +2843,7 @@ def history_enqueue(kind, rows):
     _history_queue.put(HistoryTask(seq, kind, rows))
 
 
-def history_drain():
+def history_drain(main_only=False):
     """지금까지 enqueue된 모든 history task가 실제로 hist.db에 커밋될
     때까지 기다린다(큐가 비어 있으면 즉시 반환). 워커가 그 사이 실패했다면
     (불변식 6) 그 예외를 그대로 다시 던진다 — 호출부(오토세이브/종료)는
@@ -2765,10 +2853,33 @@ def history_drain():
     "방금 큐에 넣은 hist 데이터"를 같은 시즌 안에서 다시 읽어야 할 때
     (예: 발롱도르 계산 직전 — hist read-after-write 의존성)."""
     _td = time.perf_counter()
+    _bg_active = bool(_history_bg_jobs)
     _history_queue.join()
     _perf_wait_slot()["drain_s"] += time.perf_counter() - _td
+    if _bg_active:   # 진단 — 뒤쪽 작업이 진행 중일 때의 게임 쪽 대기(게임 기록 작업 몫까지 포함한 상한)
+        HISTORY_BG_WAIT_STATS["main_join_during_bg"] += 1
+        HISTORY_BG_WAIT_STATS["main_join_during_bg_s"] += time.perf_counter() - _td
     if _history_worker_dead:
         raise RuntimeError("history writer 실패 — hist.db 저장이 중단됐습니다") from _history_worker_error
+    # [2026-11-22] main_only=False(기본 — 저장·종료·새 게임 등)면 뒤쪽 작업(장부)까지 끝날 때까지 기다린다.
+    # 게임이 기록 표를 다시 읽기 직전 동기화(history_sync_for_read)만 main_only=True — 게임은 장부를 읽지 않는다.
+    if not main_only and not _history_bg_idle.is_set():
+        _tb = time.perf_counter()
+        while not _history_bg_idle.wait(0.05):
+            if _history_worker_dead:
+                raise RuntimeError("history writer 실패 — hist.db 저장이 중단됐습니다") from _history_worker_error
+            _ensure_history_worker_started()
+        _history_queue.join()
+        _w = time.perf_counter() - _tb
+        HISTORY_BG_WAIT_STATS["waits"] += 1
+        HISTORY_BG_WAIT_STATS["seconds"] += _w
+        if _w > 0.05:
+            try:
+                _f = sys._getframe(1)
+                HISTORY_BG_WAIT_STATS["callers"].append((f"{os.path.basename(_f.f_code.co_filename)}:{_f.f_code.co_name}:{_f.f_lineno}", round(_w, 3)))
+                del HISTORY_BG_WAIT_STATS["callers"][:-20]
+            except Exception:
+                pass
 
 
 # [2026-11-01 신설, 신민용 승인 — 비동기 기록 DB 경합 수정]
@@ -2805,7 +2916,7 @@ def history_sync_for_read():
         conn.commit()
         st["commits"] += 1
     _t0 = time.perf_counter()
-    history_drain()
+    history_drain(main_only=True)   # [2026-11-22] 게임이 읽는 기록 표만 — 뒤쪽 작업(장부)은 기다리지 않는다
     st["wait_s"] += time.perf_counter() - _t0
     _history_synced_seq = seq
     st["synced"] += 1
@@ -3126,6 +3237,9 @@ def init_db(load=True):
         player_id INTEGER, year INTEGER, competition TEXT,
         matches INTEGER, goals INTEGER, assists INTEGER, rating REAL,
         PRIMARY KEY(player_id, year, competition)) WITHOUT ROWID""")
+    # [2026-11-22 신설, 신민용 승인] 기록 화면 전용 통산 장부(record_ledger.py 머리 주석) — 게임 로직은 읽지 않는다.
+    import record_ledger as _rl_schema
+    _rl_schema.create_schema(c)
 
     # [2026-09 신설, 신민용 요청: "발롱도르 등 개인상도 AI 선수들끼리(그리고
     # 나 자신도 같은 기준으로) 세계 단위로 계산해서 세계기록실에서 보고
@@ -5209,6 +5323,9 @@ def init_db(load=True):
         # [2026-10 신설, 신민용 확정 — D(나)] 임대 직전 원 소속팀 감독 관계(−1 = 저장 안 됨,
         # 기존 세이브·옛 임대). 29주 복귀·시즌 끝 복귀 때 이 값으로 복원한다.
         "ALTER TABLE my_player ADD COLUMN loan_parent_relation INTEGER DEFAULT -1",
+        # [2026-11-21 버그수정] 구단 매각 의향 기록(game_engine._club_sale_intent — 이적 요청 재평가·고가 매각 검토 창).
+        # 2026-11-20 기능에서 읽고 쓰기만 하고 컬럼을 안 만들어서, 이적 요청·고가 매각 기록 저장 때 "no such column"으로 죽었다.
+        "ALTER TABLE my_player ADD COLUMN club_sale_intent_json TEXT DEFAULT ''",
         "ALTER TABLE intl_squad ADD COLUMN slot TEXT DEFAULT ''",
         # [2026-09 신설 — 감독 시스템 ③단계] 구단 목표를 팀에 저장한다.
         # 여태 my_player.club_ambition 한 칸뿐이라 "내 팀의 목표"만 존재했고,
@@ -5883,6 +6000,12 @@ def init_db(load=True):
     _migrate_debut_contract_v1()  # [2026-10] 첫 계약 만료연도 — 기존 세이브 정리 (1회성, 아래 참고)
     _migrate_foot_distribution_v2()  # [2026-10] 주발 분포 개정(포지션별 표) — AI 주발 1회 재추첨
     _backfill_affiliate_callup_logs_v1()  # [2026-10] 산하팀→모팀 1군 콜업 누락 이적기록 1회 보정
+    # [2026-11-22] 기록 화면 통산 장부 — 무효(장부 없는 세이브·불러오기 복구로 시즌 기록이 지워짐)면 다시 만든다.
+    try:
+        import record_ledger as _rl_init
+        _rl_init.ensure_valid(get_conn())
+    except Exception as _rl_e:
+        print("[RECORD-LEDGER] 장부 점검 실패(기록 화면만 영향):", _rl_e)
     # [2026-08 신설] init_db()는 QA/AB테스트 스크립트 등이 DB_PATH를 바꿔가며
     # 같은 프로세스 안에서 여러 번 호출하기도 한다 — 그때마다 get_state()
     # 캐시가 이전 DB의 season_state를 그대로 들고 있으면 안 되므로 비운다.
@@ -8538,6 +8661,9 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False, start_year=None):
               "ai_transfer_log_archive",
               "ai_player_realstat_season"]:
         c.execute(f"DELETE FROM {t}")
+    # [2026-11-22] 기록 화면 통산 장부 — player_id·team_id가 새 판에서 재사용되므로 비우고, 빈 장부를 유효로 표시한다.
+    import record_ledger as _rl_reset
+    _rl_reset.reset_empty(c)
     # [2026-10 신설] U-23 올림픽 전용 표 — tournament_id·player_id가 새 게임에서 재사용되므로
     # 반드시 비운다(이 목록의 "새 표 추가를 깜빡함" 재발 방지). 꺼져 있으면 표 자체가 없다.
     for _t in ("oly_reserve_cut", "oly_squad_meta", "oly_squad_roles", "oly_military_benefit",
@@ -8614,6 +8740,8 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False, start_year=None):
     # 판에서 계산된 목표("우승 도전" 등)가 새 게임 첫 시즌의 감독 경질
     # 판정 기준으로 그대로 쓰인다.
     c.execute("UPDATE teams SET club_ambition=''")
+    import virtual_youth as _vy_rst
+    _vy_rst.drop_world(c)   # [2026-11-22 1단계] 이전 판 가상 팀·선수 정리(새 월드 생성이 다시 만든다)
     _reset_teams_to_league_data(c)
     _fix_affiliate_start_tiers(c)   # [2026-10-31 유스팀 작업 A] 원본 배치의 부수 순서 위반 정리(선수 생성 전)
     try:
@@ -8624,6 +8752,8 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False, start_year=None):
         pass
     _rst_mark("팀/리그 원본 복원")
     _regenerate_ai_players(c, progress_cb=progress_cb, skip_generation=skip_ai_regen)
+    if not skip_ai_regen and _vy_rst.stage1():
+        _vy_rst.build_world(c, get_game_start_year())   # [2026-11-22 1단계] 가상 유스(대상 판정은 이 시점 기준으로 고정)
     _rst_mark("선수단 재생성" + (" (건너뜀)" if skip_ai_regen else ""))
     _reset_formations_from_seed(c)
     _reset_club_strength(c)
@@ -9915,7 +10045,7 @@ def _migrate_ensure_military_world():
                 _rng = random.Random(f"military:{team_name}")
                 tendency = _rng.choices(TACTIC_TENDENCIES, TACTIC_TENDENCY_WEIGHTS)[0]
                 lean = TACTIC_TENDENCY_LEAN[tendency]
-                _f_names = list(FORMATIONS)
+                _f_names = list(_WORLDGEN_FORMATIONS)
                 _f_weights = [max(0.05, 1.5 - abs(lean - FORMATION_STYLE[f])) for f in _f_names]
                 formation = _rng.choices(_f_names, _f_weights)[0]
                 c.execute("""INSERT INTO teams(league_id,country_id,name,formation,current_tier,tactic_tendency)
@@ -9984,6 +10114,10 @@ def sync_countries():
 from constants import FORMATION_SLOTS as _FORMATION_SLOTS_FOR_SEED
 from constants import FORMATION_STYLE, TACTIC_TENDENCIES, TACTIC_TENDENCY_WEIGHTS, TACTIC_TENDENCY_LEAN
 FORMATIONS = list(_FORMATION_SLOTS_FOR_SEED.keys())
+# [2026-11-24 신민용 확정] 월드 생성 추첨·월드클래스 보정 계수용 — constants.FORMATION_WORLDGEN_EXCLUDE(3-3-2-2 두 변형)를
+# 뺀 목록. 빠진 포메이션은 시즌 전환 재추첨으로만 등장한다. 목록이 비어 있으면 FORMATIONS와 같다(순서도 같다).
+from constants import FORMATION_WORLDGEN_EXCLUDE as _WORLDGEN_EXCLUDE
+_WORLDGEN_FORMATIONS = [f for f in FORMATIONS if f not in _WORLDGEN_EXCLUDE]
 
 def _tier_to_int(tier):
     """LEAGUE_DATA의 tier 키를 정수로 정규화.
@@ -10029,7 +10163,7 @@ def _insert_leagues_and_teams(c, progress_cb=None):
             for team_name in teams:
                 tendency = random.choices(TACTIC_TENDENCIES, TACTIC_TENDENCY_WEIGHTS)[0]
                 lean = TACTIC_TENDENCY_LEAN[tendency]
-                _f_names = list(FORMATIONS)
+                _f_names = list(_WORLDGEN_FORMATIONS)
                 _f_weights = [max(0.05, 1.5 - abs(lean - FORMATION_STYLE[f])) for f in _f_names]
                 formation = random.choices(_f_names, _f_weights)[0]
                 team_rows.append((lid, cid, team_name, formation, tier, tendency))
@@ -10335,6 +10469,17 @@ _ALL_COUNTRIES_BY_RANK = []  # [2026-07 신설] 대륙 무관 전세계 (나라�
                               # 스타 슬롯 해외파 국가를 대륙 상관없이 가중 추첨할 때 사용.
 
 
+def _VY_and_not_vt(conn, alias="t."):
+    import virtual_youth as _vy
+    return _vy.and_not_vt(conn, alias)
+
+
+def _VY_nt_join():
+    """[2026-11-22 1단계] 국대 후보 조회의 팀→리그→나라 조인(virtual_youth.nt_join — 가상 유스 포함 여부는 그쪽이 판정)."""
+    import virtual_youth as _vy
+    return _vy.nt_join()
+
+
 def get_country_avg_squad_ovr(country, positions=None, min_count=8, top_n=3):
     """[2026-07 신설, 신민용 리포트: "국대 실제값이 밴드 상한을 훨씬
     넘어선다"] get_country_squad_players()(포지션당 '전 세계 태그 선수 중
@@ -10371,7 +10516,7 @@ def get_country_avg_squad_ovr(country, positions=None, min_count=8, top_n=3):
             rows = conn.execute(
                 f"""SELECT ap.id, ap.ovr
                     FROM ai_players ap JOIN teams t ON ap.team_id=t.id
-                    JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
+                    {_VY_nt_join()}
                     WHERE {where_sql} AND ap.position=? AND ap.id NOT IN ({ph}){_mil_excl_sql(conn)}{_nt_excl}
                     ORDER BY {order_by} LIMIT ?""",
                 (*params, pos, top_n)).fetchall()
@@ -10601,7 +10746,7 @@ def get_country_squad_players(country, positions=None, min_count=8, target_ovr=N
                     f"""SELECT ap.id, ap.name, ap.position, ap.ovr, ap.age, ap.foot, ap.sub_role, {_stat_cols},
                                t.name AS club, t.current_tier AS club_tier, cn.name AS club_country
                         FROM ai_players ap JOIN teams t ON ap.team_id=t.id
-                        JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
+                        {_VY_nt_join()}
                         WHERE {where_sql} AND {pos_sql} AND ap.id NOT IN ({ph}){cap_sql}{_mil_excl_sql(conn)}{_nt_excl}
                         ORDER BY {order_by} LIMIT 1""",
                     (*params, *pos_params, *cap_params, *order_params)).fetchone()
@@ -10614,7 +10759,7 @@ def get_country_squad_players(country, positions=None, min_count=8, target_ovr=N
                     f"""SELECT ap.id, ap.name, ap.position, ap.ovr, ap.age, ap.foot, ap.sub_role, {_stat_cols},
                                t.name AS club, t.current_tier AS club_tier, cn.name AS club_country
                         FROM ai_players ap JOIN teams t ON ap.team_id=t.id
-                        JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
+                        {_VY_nt_join()}
                         WHERE {where_sql} AND {pos_sql} AND ap.id NOT IN ({ph}){cap_sql}{_mil_excl_sql(conn)}{_nt_excl}
                         ORDER BY {_fallback_order} LIMIT 1""",
                     (*params, *pos_params, *cap_params, *order_params)).fetchone()
@@ -10750,7 +10895,7 @@ def get_country_nationals_for_positions(country, positions):
                    {_stat_cols},
                    t.name AS club, t.current_tier AS club_tier, cn.name AS club_country
             FROM ai_players ap JOIN teams t ON ap.team_id=t.id
-            JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
+            {_VY_nt_join()}
             WHERE ap.true_nationality=? AND ap.position IN ({pos_ph})""",
         (country,)).fetchall()
     from military_service import drop_military_countries   # [2026-10] 복무 중인 선수는 국대 제외
@@ -10787,7 +10932,7 @@ def get_country_nationals_by_position(country):
                    {_stat_cols},
                    t.name AS club, t.current_tier AS club_tier, cn.name AS club_country
             FROM ai_players ap JOIN teams t ON ap.team_id=t.id
-            JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
+            {_VY_nt_join()}
             WHERE ap.true_nationality=?""",
         (country,)).fetchall()
     # [2026-10 병역 시스템] 복무 중(군팀 소속)인 선수는 국가대표에 안 뽑힌다.
@@ -11126,7 +11271,7 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
             f"""SELECT ap.id, ap.name, ap.position, ap.ovr, ap.age, ap.foot, ap.sub_role, {_stat_cols},
                        t.name AS club, t.current_tier AS club_tier, cn.name AS club_country
                 FROM ai_players ap JOIN teams t ON ap.team_id=t.id
-                JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
+                {_VY_nt_join()}
                 WHERE ap.id IN ({placeholders})""", ids).fetchall()
         conn.close()
         result = [dict(r) for r in prows]
@@ -11146,14 +11291,15 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
         if _my_pos:
             from constants import INTL_SQUAD_TOTAL
             _target = INTL_SQUAD_TOTAL - 1
-            # [2026-11-16 국대 측면 2:2 고정] 내 자리가 측면 칸이면 그 칸 AI 중에서, 아니면 측면 칸이 아닌 AI 중에서
-            # (둘 다 아직 안 뛴 선수만) OVR 최하위를 뺀다 — 좌우 칸 정원(LB·RB·LW·RW 각 2)을 깨지 않는다.
-            from intl_engine import intl_inherit_side_cards, intl_my_join_drops
-            _cs = get_conn()
-            _sc = intl_inherit_side_cards(_cs, tournament_id, country, result)
-            _cs.close()
-            _dl, _ok_side = intl_my_join_drops(result, _sc, _my_pos, _target)
-            _drop_ids = set(_dl)
+            # [2026-11-21 신민용 확정 ①(가)] 명단이 25명(+나)이 될 만큼만, 아직 안 뛴 선수 중에서 뺀다 — 내 측면 칸 AI가
+            # 2명 이상이면 그 칸 최저, 아니면 비측면 최저(채택된 측면 분류, intl_engine.intl_my_join_drops).
+            from intl_engine import intl_my_join_drops, intl_side_recheck_after_join
+            try:
+                import sub_positions as _sp_me
+                _my_sub = _sp_me.my_sub()
+            except Exception:
+                _my_sub = None
+            _drop_ids = set(intl_my_join_drops(result, _my_pos, _target, _my_sub))
             if _drop_ids:
                 conn_d = get_conn()
                 conn_d.executemany(
@@ -11167,6 +11313,9 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
                     pass
                 conn_d.commit(); conn_d.close()
                 result = [r for r in result if r["id"] not in _drop_ids]
+                # 주전이 이미 정해진 대회면 저장된 포메이션·주전 기준으로 측면을 다시 확인(바뀌면 다시 읽는다)
+                if intl_side_recheck_after_join(tournament_id, country, result):
+                    return get_or_create_intl_squad(tournament_id, country, avg_ovr, positions)
         return result
 
     trow = conn.execute(
@@ -11211,7 +11360,7 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
                 f"""SELECT ap.id, ap.name, ap.position, ap.ovr, ap.age, ap.foot, ap.sub_role, {_stat_cols},
                            t.name AS club, t.current_tier AS club_tier, cn.name AS club_country
                     FROM ai_players ap JOIN teams t ON ap.team_id=t.id
-                    JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
+                    {_VY_nt_join()}
                     WHERE ap.id IN ({placeholders})""", source_ids).fetchall()
             conn2.close()
             if len(prows) >= 8:
@@ -11271,7 +11420,7 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
                             f"""SELECT ap.id, ap.name, ap.position, ap.ovr, ap.age, ap.foot, ap.sub_role, {_stat_cols},
                                        t.name AS club, t.current_tier AS club_tier, cn.name AS club_country
                                 FROM ai_players ap JOIN teams t ON ap.team_id=t.id
-                                JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
+                                {_VY_nt_join()}
                                 WHERE ap.id IN ({_ph_f})""", _pool).fetchall()}
                         picked += [_add[i] for i in _pool if i in _add]
                     conn_f.close()
@@ -12172,11 +12321,18 @@ def _ruled_squad_plan(formation, n):
     return out
 
 
-def _build_squad_positions_ruled(grade=None, tier=None, formation=None):
+def _build_squad_positions_ruled(grade=None, tier=None, formation=None, youth=False):
     """[2026-11] 시작 선수단 포지션 목록(선발 11 + 후보) — SEED_SQUAD_RULED_BY_FORMATION 주석 참고.
-    총원 난수(22~25명 팀의 randint)는 _build_squad_positions와 같은 자리에서 한 번만 쓴다."""
+    총원 난수(22~25명 팀의 randint)는 _build_squad_positions와 같은 자리에서 한 번만 쓴다.
+    [2026-11-21 클럽 선수단 운영 개편] CLUB_LEDGER_MODE가 "world"·"full"이면 후보 = 공통 수요 장부 목표표
+    (포메이션, C안 인원 T) − 선발(club_ledger.bench_positions, T − 11명, 난수 없음). 선발 11명은 그대로."""
     import squad_targets as _sqt
     f = _sqt._formation(formation)
+    import club_ledger as _cl
+    if _cl.world_on():
+        starters, _bench_old = _ruled_squad_plan(f, TEAM_STARTER_COUNT + 11)
+        T = _cl.target_size(grade, tier, youth)
+        return list(starters) + _cl.bench_positions(f, T)
     if (tier == 1 and grade in ("A", "S", "SS")) or (tier == 2 and grade in ("S", "SS")):
         bench_n = 15
     else:
@@ -12948,7 +13104,7 @@ def _star_formation_calibration():
     from constants import FORMATION_SLOTS as _FS, star_position_weight
     import squad_targets as _sqt
     tw = float(sum(TACTIC_TENDENCY_WEIGHTS))
-    fnames = list(_FS)
+    fnames = list(_WORLDGEN_FORMATIONS)   # [2026-11-24] 월드 생성 추첨과 같은 목록(재추첨 전용 포메이션 제외)
     pf = {}
     for tend, wt in zip(TACTIC_TENDENCIES, TACTIC_TENDENCY_WEIGHTS):
         lean = TACTIC_TENDENCY_LEAN[tend]
@@ -13647,7 +13803,9 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
         _star_w = star_slot_weights_calibrated(_starter_pos)
     elif SEED_SQUAD_RULED_BY_FORMATION:
         # [2026-11] 시작 선수단 포메이션 기준 규칙 배열 — SEED_SQUAD_RULED_BY_FORMATION 주석 참고.
-        _wsf_positions = _build_squad_positions_ruled(grade, tier, (_GEN_FORMATIONS or {}).get(team.get("tid")))
+        _wsf_positions = _build_squad_positions_ruled(
+            grade, tier, (_GEN_FORMATIONS or {}).get(team.get("tid")),
+            youth=(_YOUTH_GEN_AFF is not None and team.get("tid") in _YOUTH_GEN_AFF))
         _starter_pos = _wsf_positions[:TEAM_STARTER_COUNT]
         _star_w = star_slot_weights_calibrated(_starter_pos)
     else:

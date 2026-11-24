@@ -749,6 +749,7 @@ def get_my_domestic_sc_match(week, day=None, p=None, st=None):
         "opp": oe["team_name"] if oe else "?",
         "opp_flag": oe["flag"] if oe else "",
         "is_home": is_home,
+        "neutral": True,   # [2026-11] 중립 구장 단판 결승(시뮬도 home_adv=0) — 화면에 "중립"
         "week": week,
     }
 
@@ -956,7 +957,8 @@ def sim_my_domestic_sc_match_as_ai(week, p, reason="injury", day=None):
     import controlled_matches as _cm_abs
     _cm_abs.save_absent_match(_cs, m["home_team_id"], m["away_team_id"], info.get("is_home"),
                               t.get("name") or "국내 슈퍼컵", "domestic_sc", week=week, day=m.get("day") or day,
-                              reason=reason, real_ctx={"comp": "dsc", "tkey": f"dsc:{m['tournament_id']}"})
+                              reason=reason, real_ctx={"comp": "dsc", "tkey": f"dsc:{m['tournament_id']}"},
+                              neutral=bool(info.get("neutral")))   # [2026-11] 중립 경기면 상세·로그에 "중립"
 
 
 def simulate_my_domestic_sc_match(week, p, day=None):
@@ -1168,7 +1170,9 @@ def simulate_my_domestic_sc_match(week, p, day=None):
 
     _update_pop(p, goals, assists, rating)
     p2 = get_player()
-    ns = min(100, p2["stress"] + 20)
+    # [2026-11 통일] 리그와 같은 결과 기반 공식(game_engine.match_stress_gain) — 예전 +20 고정
+    from game_engine import match_stress_gain
+    ns = min(100, p2["stress"] + match_stress_gain(my_result))
     nh = p2["happiness"]
     if my_result == "win":
         nh = min(100, nh + 4)
@@ -1199,7 +1203,8 @@ def simulate_my_domestic_sc_match(week, p, day=None):
         events, not (_suspended or _benched), _benched, detail, pso=pso,
         engine_stats=engine_stats, engine_plog=engine_plog, player_ratings=player_ratings,
         match_extra={"score_90": ([hs90, as90] if hs90 is not None else [hs, as_]),
-                     "went_extra_time": went_et, "subs": _subs},
+                     "went_extra_time": went_et, "subs": _subs,
+                     "neutral": bool(True)},   # [2026-11] 경기 상세 머리글 "(중립)"
         # [2026-10 신설] 이 경기 AI 선수 실측 기록(real_stats)
         real_ctx={"comp": "dsc", "tkey": f"dsc:{m['tournament_id']}", "home": m["home_team_id"], "away": m["away_team_id"]})
     marker = f" [match:{detail_id}:domestic_sc]" if detail_id else ""

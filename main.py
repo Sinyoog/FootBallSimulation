@@ -73,7 +73,12 @@ class _TableClickToggle:
             if sm is not None and idx.isValid() and sm.isSelected(idx):
                 sel = sm.selectedIndexes()
                 if view.selectionBehavior() == QTableView.SelectionBehavior.SelectRows:
-                    only_this = {i.row() for i in sel} == {idx.row()}
+                    # [2026-11-23] 두 줄 묶음 표(세계 기록실 기록 표 — 선수 줄 + 활동 기간 줄, _paired_rows)는
+                    # 짝 줄(행 번호 ^ 1)까지 "이 행 하나"로 본다 — 묶음을 다시 누르면 같이 꺼진다.
+                    _grp = {idx.row()}
+                    if getattr(view, "_paired_rows", False):
+                        _grp.add(idx.row() ^ 1)
+                    only_this = {i.row() for i in sel} <= _grp and idx.row() in {i.row() for i in sel}
                 else:
                     only_this = len(sel) == 1
             self._pending = (view, idx.row(), idx.column()) if only_this else None

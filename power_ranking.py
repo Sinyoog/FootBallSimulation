@@ -55,6 +55,7 @@ game_engine.py의 연도전환 훅(_advance_week)에서 evaluation_year=(방금
   경기에 서로 다른 두 배수를 곱하면 그 전제가 깨진다).
 """
 
+import virtual_youth as _VY   # [2026-11-22 1단계] 가상 유스 공통 판정
 from dataclasses import dataclass
 from typing import Optional
 
@@ -444,6 +445,85 @@ TEAM_EXPECTED_TIER_FLOOR = {
     "B": 0, "C": 0, "D": 0, "E": 0, "F": 0,
 }
 TEAM_UNDERPERFORM_BASE_PENALTY = -4.0   # 미달 1단계당, 대회가중치를 곱해서 적용
+
+# [2026-11-24 신설, 신민용 확정 — 대륙 대회 기대 미달 "나안"] 대륙 대회(챔스·유로파·컨퍼런스·대륙 슈퍼컵·클럽 월드컵)의
+# 기대 단계를 절대 PS 등급(TEAM_EXPECTED_TIER_FLOOR) 대신 "그 대회 참가팀 안의 시즌 시작 PS 시드"로 정한다.
+# 예전엔 유럽 대회에 나가는 SS 팀(포르투갈·벨기에 등)이 5대리그 팀과 붙으면서도 4강을 기대받아 감점이 유럽에 몰렸다
+# (12시즌 측정: 대륙 대회 기대 미달 감점의 88%가 유럽, 남미·아시아·아프리카 상위 팀은 거의 0).
+# 규칙: 그 단계(PO·16강 / 8강 / 4강)에 실제로 올라간 팀 수만큼 상위 시드가 그 단계를 기대한다(4강까지만) —
+# 36팀 대회면 1~4번 시드 4강, 5~8번 8강, 9~24번 PO·16강, 25~36번 기대 없음. 대륙 슈퍼컵(4팀 전원 4강)은 자연히 감점 없음.
+# 시드는 연말 계산이 경기 결과(A)를 반영하기 "전"에 떠 둔 PS(_SEASON_START_PS — 시즌 중에는 PS가 바뀌지 않으므로 곧
+# 시즌 시작 PS)로 정한다. 국내컵·3·4부컵은 아래 D안(CUP_UNDERPERF_GAP)이 따로 맡는다. 감점 크기 공식(-4 × 부족 단계 × 대회 가중치)은
+# 그대로. False면 예전과 100% 같다.
+CONT_UNDERPERF_RELATIVE = True
+_CONT_UNDERPERF_CATS = frozenset(("champions", "europa", "conference", "super_cup", "club_world_cup"))
+_SEASON_START_PS: dict = {}   # {team_id: PS} — run_year_end_power_ranking_update가 A 반영 전에 채운다
+
+
+def relative_expected_tiers(placements: dict, seed_ps: dict, max_tier: int = 3) -> dict:
+    """대륙 대회 한 개의 {team_id: 기대 단계 서수} — placements = {team_id: 도달 단계 라벨}(_deepest_stage_participants),
+    seed_ps = {team_id: 시즌 시작 PS}. 단계 t(1=PO·16강, 2=8강, 3=4강)에 실제로 올라간 팀 수 = 그 단계 자리 수,
+    PS 상위 시드부터 자리 수 안에 들면 그 단계를 기대한다(같은 PS는 팀 id 순 — 결정적). max_tier(4강)를 넘게 기대하지 않는다."""
+    ach = {t: _STAGE_TIER_ORDINAL.get(lbl, 0) for t, lbl in placements.items()}
+    slots = {k: sum(1 for v in ach.values() if v >= k) for k in range(1, max_tier + 1)}
+    order = sorted(ach, key=lambda t: (-(seed_ps.get(t) or 0.0), t))
+    out = {}
+    for i, t in enumerate(order, start=1):
+        e = 0
+        for k in range(1, max_tier + 1):
+            if i <= slots[k]:
+                e = k
+        out[t] = e
+    return out
+
+
+# [2026-11-24 신설, 신민용 확정 — 국내컵·3·4부컵 기대 미달 "D안"] 국내컵(domestic_cup)과 3·4부컵(lower_cup)은
+# "기대 단계에 못 미쳤나"가 아니라 "누구에게 탈락했나"로만 추가 감점한다. 상대 전력 차이는 이미 경기 결과 점수(A, Elo)가
+# 경기마다 반영하는데, Elo 손실은 격차 400 근처부터 -18~19에서 멈춰서(기대승률≈1, 경기당 상한) 1부가 2부에 진 것과
+# 4부에 진 것을 거의 구분하지 못한다 — 그 구간만 B로 보완한다.
+# 예전 방식(절대 PS 등급 → 기대 단계)은 잉글랜드 2부처럼 SS·S 등급이 많은 강한 하위 리그를 EPL과 같은 기준으로 깎았고
+# (12시즌 측정: 참가 1회당 -4.76), 1부끼리 탈락과 1부가 4부에 탈락한 경우의 감점이 거의 같았다.
+# 규칙: 탈락 경기(그 대회 첫 패배) 하나만 본다. 격차 = 진 팀 시즌 시작 PS - 이긴 팀 시즌 시작 PS.
+#   격차 200(등급 한 칸)까지는 0(비슷한 상대에게 진 단판 운), 넘는 200마다 1단계(최대 3단계, 연속값) ×
+#   기존 공식 -4 × 대회 가중치(국내 리그 강도 포함). 상위 전력에게 진 탈락·우승팀은 0.
+# 대륙 대회(나안)는 그대로. False면 예전(절대 등급 기대 단계) 그대로.
+CUP_UNDERPERF_GAP = True
+# [2026-11-24 신설] 국내컵·3·4부컵 단계 판정(_deepest_stage_participants)의 3·4위전 오판정 수정 — 위 함수 주석 참고.
+# False면 예전 판정 그대로.
+CUP_PLACEMENT_FIX = True
+CUP_GAP_DEAD_ZONE = 200.0
+CUP_GAP_STEP = 200.0
+CUP_GAP_MAX_STEPS = 3.0
+_CUP_THIRD_PLACE_ROUND = "3·4위전"
+
+
+def cup_upset_steps(gap: float) -> float:
+    """탈락 상대와의 시즌 시작 PS 격차(진 팀 - 이긴 팀) → 부족 단계(0~CUP_GAP_MAX_STEPS, 연속값)."""
+    return min(CUP_GAP_MAX_STEPS, max(0.0, (gap - CUP_GAP_DEAD_ZONE) / CUP_GAP_STEP))
+
+
+def _cup_elimination_winners(conn, matches_table: str, tournament_id: int) -> dict:
+    """국내컵/3·4부컵 한 대회의 {탈락팀: 탈락시킨 팀}. 탈락 경기 = 그 팀의 첫 패배(라운드 순, 같은 라운드면 id 순) —
+    4강에서 진 팀이 3·4위전에서 한 번 더 져도 탈락 상대는 4강 상대다. 승부차기는 pso_winner가 승자."""
+    rows = conn.execute(
+        f"""SELECT home_team_id, away_team_id, home_score, away_score, pso_winner, round_idx
+            FROM {matches_table} WHERE tournament_id=? ORDER BY round_idx ASC, id ASC""",
+        (tournament_id,)).fetchall()
+    out = {}
+    for h, a, hs, as_, pso, _ri in rows:
+        if not h or not a or hs is None or as_ is None or hs < 0 or as_ < 0:
+            continue
+        if hs > as_:
+            winner, loser = h, a
+        elif as_ > hs:
+            winner, loser = a, h
+        elif pso in (h, a):
+            winner, loser = (h, a) if pso == h else (a, h)
+        else:
+            continue
+        if loser not in out:
+            out[loser] = winner
+    return out
 # [2026-08 신설, 신민용 확정: "국가 파워랭킹이 대회 성적 하나로 너무
 # 쉽게 뒤집힌다"] 예전엔 국가도 위 PLACEMENT_BASE_SCORE(클럽과 공용, 우승
 # 40)를 그대로 쓰고 COUNTRY_TIER_WEIGHT(월드컵 2.6)만 곱했다 — 그 결과
@@ -1149,6 +1229,29 @@ def _team_avg_ovr_seed(conn, team_id: int) -> float:
     return row[0] if row and row[0] else 45.0
 
 
+# [2026-11-24 신설, 신민용 확정 — 시작 점수 D안 채택] 팀 시작 점수(시드 = 해마다 A 회귀 기준점)의 실력 항을
+# 선수단 전체 평균 → 상위 11명 OVR 평균으로. 예전엔 게임 시작 순위에서 EPL 비명문 중위권(크리스털 팰리스 11위 등)이
+# 다른 리그 명문(인테르 15위·바이에른 16위·PSG 24위)보다 위였다 — 명문 보정은 주전급을 끌어올리는데, 전체 평균은
+# 리그 하한이 높아 후보층이 두꺼운 EPL이 유리했다(선발 11명 PSG 95.1 vs 팰리스 93.5인데 전체 평균은 92.1 vs 92.0).
+# 같은 시드 12시즌 측정(기준 2회 · D안 · D안+시드 속 리그 파워 50%): 시작 순위 상위 20 비명문 7→2팀, 첫 비명문 11→18위,
+# 선발 11명 상관(5대 1부) 0.896→0.980 / 12시즌 평균 상위 20 비명문 1.5→0.6, 첫 비명문 17.7→20.2위, 리그 순위는 우연 범위
+# 안(EPL 12시즌 모두 1위). 60위권 리그 해마다 이동 1.37~1.39 → 1.44(소폭 증가, 기록해 둠).
+# 리그 파워 50% 축소는 장기적으로 실력 순서와 멀어져(상관 0.821, 상위 20 비명문 2.0) 채택하지 않음 → TEAM_SEED_LP_SCALE 1.0.
+# 리그 파워 자체(compute_league_power — 개인상·대표 선발에도 쓰임)와 OVR 변화율 판정은 그대로 전체 평균을 쓴다.
+TEAM_SEED_OVR_MODE = "xi"     # "xi" = 상위 11명 평균(D안, 기본), "avg" = 선수단 전체 평균(예전)
+TEAM_SEED_LP_SCALE = 1.0      # 시드에 더하는 리그 파워 비율(1.0 유지 — 50% 축소안은 측정 후 제외)
+
+
+def _team_seed_ovr(conn, team_id: int) -> float:
+    """팀 시작 점수의 실력 항 — TEAM_SEED_OVR_MODE에 따라 전체 평균 또는 상위 11명 평균."""
+    if TEAM_SEED_OVR_MODE == "xi":
+        row = conn.execute(
+            "SELECT AVG(ovr) FROM (SELECT ovr FROM ai_players WHERE team_id=? ORDER BY ovr DESC LIMIT 11)",
+            (team_id,)).fetchone()
+        return row[0] if row and row[0] else 45.0
+    return _team_avg_ovr_seed(conn, team_id)
+
+
 def compute_league_power(conn, year: int, store: bool = True) -> dict:
     """3.1b. 리그별 OVR지표(①, 85%) + 국제실적보정(②, 15%)을 합쳐
     league_id → 리그등급보정 값을 돌려주고 league_power에 캐시한다.
@@ -1250,8 +1353,10 @@ def _team_seed_ab(conn, team_id: int, league_power_cache: dict) -> tuple:
     시점이므로 레이어B는 0에서 출발."""
     row = conn.execute("SELECT league_id FROM teams WHERE id=?", (team_id,)).fetchone()
     league_id = row[0] if row else None
-    ovr = _team_avg_ovr_seed(conn, team_id)
+    ovr = _team_seed_ovr(conn, team_id)
     league_adj = league_power_cache.get(league_id, 0.0) if league_id else 0.0
+    if TEAM_SEED_LP_SCALE != 1.0:
+        league_adj *= TEAM_SEED_LP_SCALE
     ps = SEED_BASE + (ovr - 60.0) * SEED_OVR_COEF + league_adj
     return (ps, 0.0)
 
@@ -1634,6 +1739,18 @@ def _deepest_stage_participants(conn, matches_table: str, tournament_id: int, us
         return result
     else:
         # 국내컵: round_idx 상대 서열(가장 큰 값=결승)로 근사
+        if CUP_PLACEMENT_FIX:
+            # [2026-11-24 수정] 3·4위전은 결승과 같은 round_idx라서, 예전엔 (1) 국내컵: 결승 뒤에 저장된 3·4위전이
+            # final_match로 덮여 4강 탈락 두 팀이 우승/준우승, 실제 결승 두 팀이 group_exit로 판정됐고(12시즌 2,544개 대회 전부),
+            # (2) 3·4부컵: 3·4위전 두 팀이 group_exit로 판정됐다(2,316개 전부). 3·4위전 경기를 단계 서열·결승 판정에서 빼고,
+            # 결승은 round_name='결승' 경기로 정한다. 3·4위전 두 팀은 4강까지 간 것으로 자연히 semifinal이 된다.
+            _named = conn.execute(
+                f"""SELECT home_team_id, away_team_id, home_score, away_score, pso_winner, round_idx, round_name
+                    FROM {matches_table} WHERE tournament_id=? ORDER BY id ASC""", (tournament_id,)).fetchall()
+            rows = [tuple(r[:6]) for r in _named if r[6] != _CUP_THIRD_PLACE_ROUND]
+            _final_rows = [tuple(r[:6]) for r in _named if r[6] == "결승"]
+        else:
+            _final_rows = []
         idxs = sorted({r[5] for r in rows if r[5] is not None}, reverse=True)
         rank_of_idx = {idx: min(i, 4) for i, idx in enumerate(idxs)}  # 0=F,1=SF,2=QF,3=R16,4+=조별
         best_rank = {}
@@ -1645,8 +1762,12 @@ def _deepest_stage_participants(conn, matches_table: str, tournament_id: int, us
             for tid in (home_id, away_id):
                 if tid:
                     best_rank[tid] = max(best_rank.get(tid, -1), rank)
-            if rank_of_idx.get(idx) == 0:
+            if rank_of_idx.get(idx) == 0 and not _final_rows:
                 final_match = (home_id, away_id, hs, as_, pso)
+        if _final_rows:
+            _fh, _fa, _fhs, _fas, _fpso, _fi = _final_rows[-1]
+            if _fhs is not None and _fas is not None and _fhs >= 0 and _fas >= 0:
+                final_match = (_fh, _fa, _fhs, _fas, _fpso)
         result = {}
         for tid, rank in best_rank.items():
             if rank == 4 and final_match and tid in final_match[:2]:
@@ -1795,6 +1916,17 @@ def update_team_b_for_year(conn, evaluation_year: int):
             weight = _club_comp_weight(category, continent)
             placements = _deepest_stage_participants(
                 conn, matches_table, tid, use_stage_col=(category not in ("domestic_cup", "lower_cup")))
+            _rel = None
+            if CONT_UNDERPERF_RELATIVE and category in _CONT_UNDERPERF_CATS and placements:
+                _seed = {t_: (_SEASON_START_PS[t_] if t_ in _SEASON_START_PS else _get_team_rating(conn, t_))
+                         for t_ in placements}
+                _rel = relative_expected_tiers(placements, _seed)
+            _elim = None
+            if CUP_UNDERPERF_GAP and _is_domestic and placements:
+                _elim = _cup_elimination_winners(conn, matches_table, tid)
+
+                def _ps0(t_):
+                    return _SEASON_START_PS[t_] if t_ in _SEASON_START_PS else _get_team_rating(conn, t_)
             for team_id, tier in placements.items():
                 base = PLACEMENT_BASE_SCORE[tier]
                 w = weight
@@ -1807,8 +1939,14 @@ def update_team_b_for_year(conn, evaluation_year: int):
                 # 약체 팀의 조별 탈락은 기대치대로이므로 0점 그대로 두고,
                 # 기대 단계(TEAM_EXPECTED_TIER_FLOOR)에 미달한 만큼만
                 # 대회 중요도를 곱해서 깎는다(국가 레이어와 동일한 설계).
-                _floor = TEAM_EXPECTED_TIER_FLOOR.get(_get_team_grade(conn, team_id), 0)
-                _short = _floor - _STAGE_TIER_ORDINAL.get(tier, 0)
+                if _elim is not None:  # [2026-11-24 D안] 국내컵·3·4부컵 = 탈락 상대와의 시즌 시작 PS 격차 기준
+                    _w_ = _elim.get(team_id)
+                    _short = cup_upset_steps(_ps0(team_id) - _ps0(_w_)) if _w_ else 0.0
+                elif _rel is not None:   # [2026-11-24 나안] 대륙 대회 = 참가팀 안 시즌 시작 PS 시드 기준
+                    _short = _rel.get(team_id, 0) - _STAGE_TIER_ORDINAL.get(tier, 0)
+                else:
+                    _floor = TEAM_EXPECTED_TIER_FLOOR.get(_get_team_grade(conn, team_id), 0)
+                    _short = _floor - _STAGE_TIER_ORDINAL.get(tier, 0)
                 if _short > 0:
                     _add_team_b(conn, team_id,
                                  TEAM_UNDERPERFORM_BASE_PENALTY * _short * w,
@@ -1828,12 +1966,66 @@ def _intl_tournament_weight_key(kind: str, name: str):
     return _country_tournament_weight(kind, name)
 
 
+# ── [2026-11-24 신설, 신민용 확정 — 국가 파워랭킹 개편 4개] 모두 False면 예전 동작 그대로. ──
+# ① 본선 기대 단계 = 대회마다 참가국 안 상대평가(COUNTRY_UNDERPERF_RELATIVE).
+#    예전: 등급 고정 기대치(SS 4강 / S 8강 / A 16강, COUNTRY_EXPECTED_TIER_FLOOR).
+#    지금: 그 대회 조 추첨 전력(intl_entries.ovr — 본선 포트 추첨 기준과 같음) 순으로, 실제 단계별 진출 자리 수만큼
+#    상위 시드가 그 단계를 기대한다(클럽 대륙 대회 나안과 같은 relative_expected_tiers). 기대는 4강까지.
+#    월드컵만 기대 상한 8강(COUNTRY_WC_EXPECT_MAX_TIER): 상위 8개 시드 전력 차가 1.5 안팎이라 4강 진출이 시드 순서와
+#    거의 무관했다(12시즌: 시드 1~4 = 3/12, 5~8 = 5/12). 4강 기대를 두면 1·2번 시드가 8강에서 5·6번 시드(전력 차 1 안쪽)에
+#    진 것까지 부진으로 쌓였다 — 국내컵 D안의 "비슷한 상대에게 진 탈락은 운" 원칙과 같은 판단.
+#    그래서 월드컵 = 시드 1~8 8강 기대 / 9~16 16강 기대 / 17 이하 기대 없음(1·2번 시드도 8강이면 충족).
+# ② 예선 탈락 판정 = 예선 안 상대평가(COUNTRY_QUAL_RELATIVE).
+#    예전: 예선에서 떨어진 나라는 전부 예선 탈락(−1) — 약소국이 떨어질 때마다 부진 연속이 쌓였고, 커진 부진 배율로 잃은
+#    점수를 제로섬으로 강팀이 가져갔다(12시즌 부진 연속 1,458건, 그중 5 이상 281건).
+#    지금: 그 예선의 추첨 전력(intl_entries.ovr — 예선 조 포트 기준과 같음) 순으로, 실제 통과국 수(qual_results, PO 승자
+#    포함, 그 예선 참가국만)만큼 상위 시드가 통과를 기대한다. 그 시드가 떨어졌을 때만 예선 탈락 부진·감점.
+#    기대 밖 나라가 떨어진 건 "기대대로"(부진 아님, 감점 없음).
+# ③ 부진 배율은 점수를 잃는 쪽에만(COUNTRY_STREAK_LOSER_ONLY).
+#    예전: 경기 K = (두 나라 유효 K) 평균 — 부진 중인 나라가 이길 때도 커진 K로 점수를 더 얻어 부진이 오히려 회복을
+#    빠르게 했다(프랑스: 부진 기간 85경기 +279 / 24경기 −200). "올리기는 어렵고 떨어지기는 쉽게" 원칙과 반대.
+#    지금: K = (얻는 쪽 기본 K + 잃는 쪽 유효 K) / 2. 무승부도 기대승률로 잃는 쪽을 가른다(실제 − 기대 < 0인 쪽).
+#    정확히 기대와 같으면(차이 0) 어느 쪽에도 배율 없음. 경기당 상한·제로섬은 그대로.
+# ④ 홈 보너스 +40은 실제 홈·원정 경기(예선)에만(COUNTRY_NEUTRAL_HOME_ZERO) — 판정은 경기 엔진과 같은
+#    constants.intl_kind_is_neutral. 예전엔 중립 본선에서도 명단상 홈에 +40을 줘서, 명단상 홈(대부분 강한 쪽)이
+#    12시즌 3,711경기에서 합계 3,400점가량 숨은 감점을 받았다.
+# 12시즌 정적 재계산(같은 기록, 지금 코드 → 4개 모두): 순위 상관 0.9995, 상위 30 구성 그대로, 상위 10은 1개국 교체.
+COUNTRY_UNDERPERF_RELATIVE = True
+COUNTRY_WC_EXPECT_MAX_TIER = 2      # 월드컵 기대 상한(2 = 8강). 3이면 다른 대회처럼 4강까지.
+COUNTRY_QUAL_RELATIVE = True
+COUNTRY_STREAK_LOSER_ONLY = True
+COUNTRY_NEUTRAL_HOME_ZERO = True
+
+
+def _country_home_bonus(kind) -> float:
+    if not COUNTRY_NEUTRAL_HOME_ZERO:
+        return HOME_BONUS
+    from constants import intl_kind_is_neutral
+    return 0.0 if intl_kind_is_neutral(kind) else HOME_BONUS
+
+
+def _country_match_delta(rh: float, ra: float, gh: str, ga: str, r: float, weight: float, sw: float,
+                         is_final: bool, home_bonus: float, sh: int, sa: int) -> float:
+    """국가 경기 하나의 홈 쪽 점수 변화(원정은 부호만 반대). ③ 꺼져 있으면 match_delta 그대로."""
+    if not COUNTRY_STREAK_LOSER_ONLY:
+        d_home, _ = match_delta(rh, ra, gh, ga, r, weight, sw, is_final=is_final, home_bonus=home_bonus,
+                                streak_home=sh, streak_away=sa)
+        return d_home
+    diff = r - expected_score(rh, ra, home_bonus)      # > 0: 홈이 얻고 원정이 잃음, < 0: 반대
+    kh = effective_k_for_grade(gh, sh) if diff < 0 else k_for_grade(gh)
+    ka = effective_k_for_grade(ga, sa) if diff > 0 else k_for_grade(ga)
+    raw = (kh + ka) / 2.0 * weight * sw * diff
+    cap = DELTA_CAP_FINAL if is_final else DELTA_CAP
+    return max(-cap, min(cap, raw))
+
+
 def _update_country_a_from_matches(conn, tournament_id: int, year: int, weight: float,
-                                    stage_weight_override: Optional[float] = None):
+                                    stage_weight_override: Optional[float] = None, kind=None):
     rows = conn.execute(
         """SELECT home, away, home_score, away_score, pso_winner, stage
            FROM intl_matches WHERE tournament_id=? ORDER BY id ASC""",
         (tournament_id,)).fetchall()
+    hb = _country_home_bonus(kind)
     for home, away, hs, as_, pso, stage in rows:
         if not home or not away:
             continue
@@ -1845,10 +2037,9 @@ def _update_country_a_from_matches(conn, tournament_id: int, year: int, weight: 
         rh, ra = _get_country_rating(conn, home), _get_country_rating(conn, away)
         gh, ga = grade_for_ps(rh), grade_for_ps(ra)
         sh, sa = _get_country_streak(conn, home), _get_country_streak(conn, away)
-        d_home, d_away = match_delta(rh, ra, gh, ga, r, weight, sw, is_final=is_final,
-                                      streak_home=sh, streak_away=sa)
+        d_home = _country_match_delta(rh, ra, gh, ga, r, weight, sw, is_final, hb, sh, sa)
         _add_country_a(conn, home, d_home, year)
-        _add_country_a(conn, away, d_away, year)
+        _add_country_a(conn, away, -d_home, year)
 
 
 def update_country_ratings_for_year(conn, evaluation_year: int):
@@ -1868,13 +2059,13 @@ def update_country_ratings_for_year(conn, evaluation_year: int):
                 is_playoff_final = False  # 세부 판별은 TUNE LATER, 기본 1.0으로 처리
                 _update_country_a_from_matches(
                     conn, tid, evaluation_year, base_weight,
-                    stage_weight_override=1.2 if is_playoff_final else 1.0)
+                    stage_weight_override=1.2 if is_playoff_final else 1.0, kind=kind)
             continue
         category, weight = wk
         if category == "region":
             region = _region_of_cup_name(name)
             weight = regional_cup_tier_weight(region) if region else 0.9
-        _update_country_a_from_matches(conn, tid, evaluation_year, weight)
+        _update_country_a_from_matches(conn, tid, evaluation_year, weight, kind=kind)
     conn.commit()
 
 
@@ -1908,6 +2099,8 @@ def update_country_b_for_year(conn, evaluation_year: int):
     # 예선 탈락(본선 진출 실패)은 group_exit보다도 아래인 -1로 취급.
     country_best_tier_this_year: dict = {}
     country_qual_fail_weight: dict = {}
+    # [2026-11-24 ①②] 상대평가 판정용 — 나라별 그 해 가장 좋은 (도달 단계 − 기대 단계). 0 이상이면 기대 충족.
+    country_margin: dict = {}
 
     for tid, kind, name in main_rows:
         if kind in ("power_eval", "power_eval_extra"):
@@ -1927,6 +2120,14 @@ def update_country_b_for_year(conn, evaluation_year: int):
             weight = regional_cup_tier_weight(region) if region else 0.9
         placements = _deepest_stage_participants(conn, "intl_matches", tid, use_stage_col=True) \
             if False else _country_deepest_stage(conn, tid)
+        _exp = None
+        if COUNTRY_UNDERPERF_RELATIVE and placements:
+            # ① 본선 조 추첨 전력 순 상대평가(월드컵은 기대 상한 COUNTRY_WC_EXPECT_MAX_TIER)
+            _seed = dict(conn.execute(
+                "SELECT country, ovr FROM intl_entries WHERE tournament_id=?", (tid,)).fetchall())
+            _exp = relative_expected_tiers(placements, _seed)
+            if kind == "world":
+                _exp = {c_: min(e_, COUNTRY_WC_EXPECT_MAX_TIER) for c_, e_ in _exp.items()}
         champion = None
         for country, tier in placements.items():
             base = COUNTRY_PLACEMENT_BASE_SCORE[tier]
@@ -1939,6 +2140,9 @@ def update_country_b_for_year(conn, evaluation_year: int):
             ordinal = _STAGE_TIER_ORDINAL[tier]
             country_best_tier_this_year[country] = max(
                 country_best_tier_this_year.get(country, -1), ordinal)
+            if _exp is not None:
+                _m = min(ordinal, 3) - _exp.get(country, 0)
+                country_margin[country] = max(country_margin.get(country, -99), _m)
 
     # 예선 탈락 페널티(4.6): 예선에 참가했지만 같은 해 본선 entries에 없는 국가
     for qtid, qkind, qname in qual_rows:
@@ -1947,14 +2151,37 @@ def update_country_b_for_year(conn, evaluation_year: int):
                                   "euro": ("euro", 1.3)}.get(base_kind, (None, 1.0))
         qual_countries = {r[0] for r in conn.execute(
             "SELECT DISTINCT country FROM intl_entries WHERE tournament_id=?", (qtid,)).fetchall()}
-        # 같은 해, 같은 계열의 본선 entries
-        main_countries = set()
-        for tid, kind, name in main_rows:
-            if (base_kind == "wc" and kind == "world") or \
-               (base_kind in ("cont", "euro") and kind == "continent"):
-                main_countries |= {r[0] for r in conn.execute(
-                    "SELECT DISTINCT country FROM intl_entries WHERE tournament_id=?",
-                    (tid,)).fetchall()}
+        # [2026-11-24 버그수정, 신민용 확정] 예선 통과 여부는 예선 통과국 기록(qual_results)으로 판정한다.
+        # 예전엔 "같은 해 본선 명단에 없으면 탈락"이었는데, 네이션스 예선(짝수 해)은 본선이 다음 해(홀수 해)라
+        # 예선 해 연말 평가에서 통과국까지 전원 예선 탈락으로 잡혔다(12시즌 586건 — 그 해 다른 대회에서 기대치를
+        # 못 채운 나라는 예선 탈락 감점 −8.8×배율과 부진 연속 +1). 또 유로 예선(홀수 해) 탈락국이 같은 해 네이션스
+        # 본선에 나갔으면 그 명단에 걸려 탈락이 아닌 것으로 잡혔다. 통과국 기록은 예선이 끝날 때 저장되므로
+        # (intl_engine._finalize_qual / _finalize_qual_po) 예선 해 연말에는 이미 있다:
+        #   월드컵 예선 → ('world', 그 해) / 유로 예선 → ('continent', 그 해) / 네이션스 예선 → ('nations', 다음 해).
+        # 본선 성적(B 배점)은 그대로 본선이 열린 해에 반영된다. 통과국 기록이 아예 없는 옛 세이브만 예전 방식.
+        from constants import is_nations_qual_year as _is_nq_year
+        if base_kind == "wc":
+            _qk, _qy = "world", evaluation_year
+        elif base_kind == "cont" and _is_nq_year(evaluation_year):
+            _qk, _qy = "nations", evaluation_year + 1
+        else:
+            _qk, _qy = "continent", evaluation_year
+        try:
+            _passed = {r[0] for r in conn.execute(
+                "SELECT DISTINCT country FROM qual_results WHERE kind=? AND target_year=?", (_qk, _qy)).fetchall()}
+        except Exception:
+            _passed = set()
+        if _passed:
+            main_countries = _passed
+        else:
+            # 같은 해, 같은 계열의 본선 entries (예전 방식)
+            main_countries = set()
+            for tid, kind, name in main_rows:
+                if (base_kind == "wc" and kind == "world") or \
+                   (base_kind in ("cont", "euro") and kind == "continent"):
+                    main_countries |= {r[0] for r in conn.execute(
+                        "SELECT DISTINCT country FROM intl_entries WHERE tournament_id=?",
+                        (tid,)).fetchall()}
         failed = qual_countries - main_countries
         # [2026-09 재현성 버그수정] failed는 국가명(문자열) 집합이라
         # 순회 순서가 PYTHONHASHSEED에 좌우된다. 여기서 채우는
@@ -1963,10 +2190,27 @@ def update_country_b_for_year(conn, evaluation_year: int):
         # (부동소수 누적 순서까지) 실행마다 달라진다. 국가명 사전순으로
         # 고정한다 — 각 국가에 들어가는 값 자체는 서로 독립이라(max/합)
         # 순서를 바꿔도 결과값은 동일, 밸런스 무영향.
+        _expected_pass = None
+        if COUNTRY_QUAL_RELATIVE:
+            # ② 예선 조 추첨 전력(그 예선 intl_entries.ovr) 순으로, 실제 통과국 수(그 예선 참가국 중 통과 — PO 승자 포함)만큼
+            # 상위 시드가 통과를 기대한다. 같은 전력은 국가명 순(결정적).
+            _qseed = dict(conn.execute(
+                "SELECT country, ovr FROM intl_entries WHERE tournament_id=?", (qtid,)).fetchall())
+            _slots = len(qual_countries & main_countries)
+            _order = sorted(qual_countries, key=lambda c_: (-(_qseed.get(c_) or 0.0), c_))
+            _expected_pass = set(_order[:_slots])
         for country in sorted(failed):
+            if _expected_pass is not None and country not in _expected_pass:
+                # ② 기대 밖 나라의 탈락 = 기대대로(부진 아님, 감점 없음). 그 해 판정에는 "기대 충족" 증거로 넣는다.
+                country_margin[country] = max(country_margin.get(country, -99), 0)
+                country_best_tier_this_year[country] = max(
+                    country_best_tier_this_year.get(country, -1), _STAGE_TIER_ORDINAL["champion"])
+                continue
             country_best_tier_this_year[country] = max(
                 country_best_tier_this_year.get(country, -1), -1)
             country_qual_fail_weight[country] = country_qual_fail_weight.get(country, 0.0) + base_weight
+            if _expected_pass is not None:
+                country_margin[country] = max(country_margin.get(country, -99), -1)
 
     # [2026-09 신설, 부진 스트릭] 위에서 모은 "이 해 최고 성적"을 등급별
     # 기대 스테이지(COUNTRY_EXPECTED_TIER_FLOOR)와 비교해 streak를
@@ -1979,10 +2223,20 @@ def update_country_b_for_year(conn, evaluation_year: int):
     for country, best_tier in country_best_tier_this_year.items():
         grade = _get_country_grade(conn, country)
         floor = COUNTRY_EXPECTED_TIER_FLOOR.get(grade, 0)
-        is_underperform = best_tier < floor
+        qual_w = country_qual_fail_weight.get(country)
+        if COUNTRY_UNDERPERF_RELATIVE:
+            # ① 본선은 대회별 상대 기대 단계, 예선 탈락은 ②가 켜져 있으면 위 margin(기대 시드만 −1),
+            # 꺼져 있으면 예전처럼 등급 기대치 대비(−1 − floor). 그 해 가장 좋은 것 기준(예전과 같은 가장 후한 해석).
+            _ms = []
+            if country in country_margin:
+                _ms.append(country_margin[country])
+            if qual_w and not COUNTRY_QUAL_RELATIVE:
+                _ms.append(-1 - floor)
+            is_underperform = bool(_ms) and max(_ms) < 0
+        else:
+            is_underperform = best_tier < floor
         old_streak = _get_country_streak(conn, country)
         new_streak = old_streak + 1 if is_underperform else 0
-        qual_w = country_qual_fail_weight.get(country)
         if is_underperform:
             bucket = min(new_streak, 5)
             mult = STREAK_PENALTY_MULTIPLIER.get(bucket, STREAK_PENALTY_MULTIPLIER[5])
@@ -1992,7 +2246,8 @@ def update_country_b_for_year(conn, evaluation_year: int):
             else:
                 _add_country_b(conn, country, COUNTRY_UNDERPERFORM_BASE_PENALTY * mult,
                                 evaluation_year)
-        elif qual_w:
+        elif qual_w and not COUNTRY_QUAL_RELATIVE:
+            # [2026-11-24] ②가 켜져 있으면 기대 시드의 예선 탈락이라도 같은 해 다른 본선에서 기대를 채웠으면 감점 없음.
             # 이론상 예선탈락(best_tier=-1)은 항상 floor(최소 0) 밑이라
             # is_underperform=True가 되므로 이 분기는 실제로는 안 타지만,
             # 방어적으로 남겨둔다(배율 없이 기본 페널티만).
@@ -2095,6 +2350,7 @@ def apply_team_season_regression(conn, evaluation_year: int, league_power_cache:
     from constants import CLUB_B_DECAY_RATE
     teams = conn.execute("SELECT id FROM teams").fetchall()
     teams = _drop_mil_teams(conn, teams)   # [2026-10] 군팀 제외
+    teams = _VY.drop_rows(conn, teams, 0)   # [2026-11-22 1단계] 가상 유스 제외
     for (team_id,) in teams:
         a, b = _get_team_ab(conn, team_id)
         ps = a + b
@@ -2195,6 +2451,7 @@ def compute_team_power_rankings(conn, evaluation_year: int) -> list:
         """SELECT t.id, t.name, c.continent, c.name
            FROM teams t JOIN countries c ON t.country_id = c.id""").fetchall()
     teams = _drop_mil_teams(conn, teams)   # [2026-10] 군팀 제외
+    teams = _VY.drop_rows(conn, teams, 0)   # [2026-11-22 1단계] 가상 유스 제외
     entries = []
     for team_id, team_name, continent, country in teams:
         rating = _get_team_rating(conn, team_id)
@@ -2277,6 +2534,13 @@ def run_year_end_power_ranking_update(conn, evaluation_year: int):
     ensure_power_ranking_tables(conn)
     ensure_initial_team_power_ranking(conn)
     ensure_initial_country_power_ranking(conn)
+
+    # [2026-11-24 나안] 대륙 대회 기대 미달 시드용 — 경기 결과(A)를 반영하기 전 PS(= 시즌 시작 PS)를 떠 둔다.
+    # B 계산은 이 값만 쓰고 현재 PS를 다시 읽지 않는다(판정 시점 혼용 방지).
+    _SEASON_START_PS.clear()
+    if CONT_UNDERPERF_RELATIVE or CUP_UNDERPERF_GAP:
+        for _t, _a, _b in conn.execute("SELECT team_id, a_rating, b_rating FROM team_power_rating").fetchall():
+            _SEASON_START_PS[_t] = (_a or 0.0) + (_b or 0.0)
 
     # [2026-08 신설] 파이썬 콘솔에서 set_power_debug_teams_by_name()을 따로
     # 호출할 필요 없이, 켜져 있으면(DEBUG_POWER_RANKING_TRACKING=True) 여기서
@@ -2406,6 +2670,7 @@ def _team_seed_entries(conn) -> list:
         """SELECT t.id, t.name, cn.continent, cn.name, t.current_tier
            FROM teams t JOIN countries cn ON t.country_id = cn.id""").fetchall()
     rows = _drop_mil_teams(conn, rows)   # [2026-10] 군팀 제외
+    rows = _VY.drop_rows(conn, rows, 0)   # [2026-11-22 1단계] 가상 유스 제외
     entries = []
     for team_id, name, continent, country, tier in rows:
         ps, _ = _team_seed_ab(conn, team_id, league_power_cache)

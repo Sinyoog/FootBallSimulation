@@ -116,7 +116,10 @@ def sim_target_match(hid, aid, *, home_adv, extra_time=False, comp_name="", kind
     try:
         if is_league:
             _accum_realstat(sim)
-        did = _save_spectator(sim, hid, aid, focus, comp_name, kind, week, day)
+        # [2026-11] 중립 경기 = 호출부가 홈 이점 0을 넘긴 경기(결승·3·4위전·국내 슈퍼컵 등 — 홈 이점이 있는
+        # 경기는 항상 1.5~4.5라 0이 될 수 없다).
+        did = _save_spectator(sim, hid, aid, focus, comp_name, kind, week, day,
+                              neutral=(not home_adv))
     except Exception as e:
         ge._chain_note_error("g2-save", e)
     SIM_LOG.append({"h": hid, "a": aid, "focus": focus, "hs": hs, "as": as_, "detail_id": did,
@@ -196,7 +199,8 @@ def _events(sim, focus_side):
     return ev
 
 
-def _save_spectator(sim, hid, aid, focus, comp_name, kind, week, day, absence_reason="spectator"):
+def _save_spectator(sim, hid, aid, focus, comp_name, kind, week, day, absence_reason="spectator",
+                    neutral=False):
     import game_engine as ge
     from database import get_conn
     from match_sim import match_flow
@@ -234,6 +238,7 @@ def _save_spectator(sim, hid, aid, focus, comp_name, kind, week, day, absence_re
         "score_90": [sim.get("home_score_90", hs), sim.get("away_score_90", as_)],
         "went_extra_time": bool(sim.get("went_extra_time")),
         "subs": {"home": sim.get("home_subs") or [], "away": sim.get("away_subs") or []},
+        "neutral": bool(neutral),   # [2026-11] 경기 상세 머리글 "(중립)"
     }
     pr = {"home": sim.get("home_player_ratings") or [], "away": sim.get("away_player_ratings") or []}
     conn = get_conn()
@@ -252,7 +257,7 @@ def _save_spectator(sim, hid, aid, focus, comp_name, kind, week, day, absence_re
     conn.commit()
     conn.close()
     # 로그 — 클릭하면 관전 기록이 열리도록 SPECTATOR_ID_BASE를 더한 id를 마커에 쓴다.
-    loc = "홈" if focus_home else "원정"
+    loc = "중립" if neutral else ("홈" if focus_home else "원정")
     _head = {"spectator": "👀 관전", "injury": "🚑 부상 결장"}.get(absence_reason, "결장")
     ge.add_log("─" * 44, "sep")
     ge.add_log(f"{_head}  [{comp_name}]  {ge._day_label(week, day)}  ({loc}) "
@@ -268,7 +273,7 @@ def _save_spectator(sim, hid, aid, focus, comp_name, kind, week, day, absence_re
 
 
 def save_absent_match(sim, home_id, away_id, is_home, comp_name, kind, week=None, day=None,
-                      reason="injury", real_ctx=None):
+                      reason="injury", real_ctx=None, neutral=False):
     """[2026-10 신설, 신민용 요청: "내가 부상을 입었어도 경기 상세는 뜨게 — 다만 라인업에 내가 없어야"]
     내가 결장한 내 팀 경기(각 대회의 sim_my_*_as_ai)는 이미 체인 엔진으로(나 없이) 결과를 낸다 — 그 경기
     기록(sim)을 관전 기록 표(spectator_match_details)에 같은 모양으로 저장하고, 로그에 클릭 마커를 남긴다.
@@ -283,7 +288,7 @@ def save_absent_match(sim, home_id, away_id, is_home, comp_name, kind, week=None
     focus = home_id if is_home else away_id
     try:
         return _save_spectator(sim, home_id, away_id, focus, comp_name, kind, week, day,
-                               absence_reason=reason or "injury")
+                               absence_reason=reason or "injury", neutral=neutral)
     except Exception as e:
         print(f"[ABSENT-DETAIL] 결장 경기 상세 저장 실패(건너뜀): {e}")
         return None

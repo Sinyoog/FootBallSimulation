@@ -612,7 +612,7 @@ class _ChainMatch:
         self.goal_mult = float(goal_mult or 1.0)   # [2026-11 득점 환경] shot()의 xG 배율
         # 시드가 없으면 전역 random에서 시드를 하나 뽑는다 — 게임 전체 난수 흐름(세이브 재현성)과 이어지게.
         self.rng = random.Random(seed) if seed is not None else random.Random(random.getrandbits(64))
-        # [G1] 선수별 카드 성향 보정 {선수 id: {"yellow_add", "red_add"}} — 내 선수 성격('폭력적') 등.
+        # [G1] 선수별 카드 성향 보정 {선수 id: {"yellow_add", "red_add", "no_cards"}} — 내 선수 성격('폭력적'·'페어플레이어') 등.
         self.pmods = player_mods or {}
         r = self.rng
         from constants import FORMATION_SLOTS
@@ -1037,6 +1037,8 @@ class _ChainMatch:
         if _pm:
             p_red += _pm.get("red_add", 0.0)
             p_y += _pm.get("yellow_add", 0.0)
+            if _pm.get("no_cards"):    # [2026-11-21] 페어플레이어(내 선수 성격) — 파울해도 카드 없음. 난수 r은 그대로 뽑는다
+                p_red = p_y = 0.0
         if r < p_red:
             self.send_off(D, d.p, "red")
             self.half_delays["cards"] += 1

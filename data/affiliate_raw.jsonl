@@ -410,12 +410,12 @@
   "total_teams": 110,
   "affiliates": [
     {
-      "team_name": "벤피카 B",
+      "team_name": "SL 벤피카 B",
       "tier": 2,
-      "parent_team_name": "벤피카"
+      "parent_team_name": "SL 벤피카"
     },
     {
-      "team_name": "포르투 B",
+      "team_name": "FC 포르투 B",
       "tier": 2,
       "parent_team_name": "FC 포르투"
     },

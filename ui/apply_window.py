@@ -64,6 +64,8 @@ def _prob_label(prob: float, blocked, scale: float = 1.0):
         return "⛔ 16세부터 입단 가능 (불가)", "#888888"
     if blocked == "age_foreign":  # [2026-11-19 MY_AGE16_RULES] 16세 미만 해외 산하팀 불가
         return "⛔ 16세 미만 해외 입단 불가", "#888888"
+    if blocked == "youth_lower":  # [2026-11-21] 산하팀은 같은 구단 중 가장 낮은 리그 팀부터
+        return "⛔ 하위 유스팀부터 지원 (불가)", "#888888"
     if blocked == "applied":      # [2026-11-18] 같은 구단은 한 지원 기간에 1번
         return "⛔ 이미 지원함 (이번 기간)", "#888888"
     if blocked:
@@ -74,6 +76,14 @@ def _prob_label(prob: float, blocked, scale: float = 1.0):
         if prob >= th * scale:
             return label, color
     return _PROB_BANDS[-1][1], _PROB_BANDS[-1][2]
+
+
+# [2026-11-21 신설, 신민용 리포트: "팀 검색할 때 렉 너무 심하다"] 이름 검색은 search_teams가 최대 500팀을 돌려주는데
+# 팀마다 성공 확률 계산(DB 조회 여러 번)을 해서 한 번에 1초 가까이 걸렸고, 글자 하나 칠 때마다 그걸 다시 했다.
+# ① 입력이 멈춘 뒤 한 번만 검색(_SEARCH_DEBOUNCE_MS) ② 표시는 앞쪽 _MAX_SHOW_ROWS팀까지(정확 일치 > 접두 일치 > 이름순이라
+# 찾는 팀은 앞에 온다 — 더 넓으면 국가·부 필터로 좁힌다) ③ 창이 열려 있는 동안 팀별 확률을 캐시(지원하면 비움).
+_SEARCH_DEBOUNCE_MS = 300
+_MAX_SHOW_ROWS = 100
 
 
 class ApplyWindow(QDialog):
@@ -89,6 +99,8 @@ class ApplyWindow(QDialog):
         self._selected_team_id = None
         self._selected_team_name = None
         self._team_info_wins = []  # [2026-08 신설] "📊 최근 성적"으로 띄운 창들 — GC 방지용 보관
+        self._ctx = None           # [2026-11-21] 선수측 계산 캐시(창 열린 동안 동일 — 지원 후 비움)
+        self._view_cache = {}      # [2026-11-21] {team_id: (prob, blocked)}
         # [2026-08 신설, 난이도 시스템] 어려움 난이도는 "누가 강팀인지" 알
         # 수 없어야 하므로(신민용 확정) 평균OVR 컬럼과 OVR 정렬 필터를
         # 뺀다 — 부(1부/2부)·국가등급(S/A/B..)·이름검색은 그대로 유지
@@ -106,6 +118,9 @@ class ApplyWindow(QDialog):
         self.attempts_lbl.setObjectName("attemptsLbl")
         top.addWidget(self.attempts_lbl)
         top.addStretch()
+        self.count_lbl = QLabel()   # [2026-11-21] 결과가 표시 상한보다 많을 때 안내
+        self.count_lbl.setObjectName("hintLbl")
+        top.addWidget(self.count_lbl)
         root.addLayout(top)
 
         hint = QLabel("팀을 검색해서 원하는 곳에 직접 지원해보세요. "
@@ -117,7 +132,12 @@ class ApplyWindow(QDialog):
         search_row = QHBoxLayout()
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("팀명 · 리그명 · 국가명 검색")
-        self.search_edit.textChanged.connect(self._do_search)
+        # [2026-11-21] 글자마다 검색하지 않고 입력이 멈추면 한 번만(_SEARCH_DEBOUNCE_MS).
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(_SEARCH_DEBOUNCE_MS)
+        self._search_timer.timeout.connect(self._do_search)
+        self.search_edit.textChanged.connect(lambda *_: self._search_timer.start())
         search_row.addWidget(self.search_edit, 3)
 
         self.grade_combo = QComboBox()
@@ -227,7 +247,8 @@ class ApplyWindow(QDialog):
             # [2026-10] 군대는 직접 지원 대상이 아니다(입대는 오퍼 창 맨 위 군팀 카드로만) — 국가 목록에서도 뺀다.
             if _is_mil(c.get("name")):
                 continue
-            self.country_combo.addItem(f"{c.get('flag','')} {c['name']}", c["id"])
+            # [2026-11-21 신민용 요청] 국기 이모지 없이 국가명만(윈도우에선 "🇪🇸"가 글자로 보여 지저분함).
+            self.country_combo.addItem(c["name"], c["id"])
         idx = self.country_combo.findData(prev_id)
         self.country_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.country_combo.blockSignals(False)
@@ -270,6 +291,7 @@ class ApplyWindow(QDialog):
             self.grade_combo.setEnabled(False)
 
     def _do_search(self, *_):
+        self._search_timer.stop()
         name_query = self.search_edit.text().strip() or None
         grade = self.grade_combo.currentData()
         country_id = self.country_combo.currentData()
@@ -280,24 +302,39 @@ class ApplyWindow(QDialog):
         # (대한민국 국민도 마찬가지 — 입대는 오퍼 창 맨 위 군팀 카드로만 한다).
         self._rows = wb.search_teams(name_query=name_query, grade=grade, country_id=country_id,
                                       tier=tier, sort=sort, limit=30, exclude_military=True)
+        _n = len(self._rows)
+        if _n > _MAX_SHOW_ROWS:
+            self._rows = self._rows[:_MAX_SHOW_ROWS]
+            self.count_lbl.setText(f"검색 결과 {_n}팀 중 {_MAX_SHOW_ROWS}팀 표시 — 국가·부 필터로 좁혀 보세요")
+        else:
+            self.count_lbl.setText("")
         self._populate_table()
 
+    def _view(self, team_id):
+        """[2026-11-21] 팀별 (확률, 막힘 사유, 배율) — 창이 열린 동안 캐시."""
+        if self._ctx is None:
+            self._ctx = get_apply_player_context()
+        v = self._view_cache.get(team_id)
+        if v is None:
+            v = self._view_cache[team_id] = direct_apply_view(team_id, self._ctx)
+        return v[0], v[1], direct_apply_scale(self._ctx)
+
     def _populate_table(self):
+        self.table.setUpdatesEnabled(False)
         self.table.setRowCount(len(self._rows))
-        ctx = get_apply_player_context()
         for i, r in enumerate(self._rows):
             if self._hard:
                 vals = [
-                    f"{r.get('flag','')} {r['country']}", r["name"],
+                    r["country"], r["name"],
                     f"{r['tier']}부", r["grade"],
                 ]
                 prob_col = None
             else:
                 avg_ovr = r.get("avg_ovr") or 0
-                prob, blocked = direct_apply_view(r["id"], ctx)
-                label, color = _prob_label(prob, blocked, direct_apply_scale(ctx))
+                prob, blocked, _sc = self._view(r["id"])
+                label, color = _prob_label(prob, blocked, _sc)
                 vals = [
-                    f"{r.get('flag','')} {r['country']}", r["name"],
+                    r["country"], r["name"],
                     f"{r['tier']}부", r["grade"],
                     f"{avg_ovr:.1f}", label,
                 ]
@@ -309,6 +346,7 @@ class ApplyWindow(QDialog):
                     item.setForeground(QColor(color))
                 item.setData(Qt.ItemDataRole.UserRole, r["id"])
                 self.table.setItem(i, j, item)
+        self.table.setUpdatesEnabled(True)
         self.table.clearSelection()
         self._selected_team_id = None
         self._selected_team_name = None
@@ -334,9 +372,8 @@ class ApplyWindow(QDialog):
         if self._hard:
             self.detail_lbl.setText(f"{r['name']} ({r['country']}, {r['tier']}부)")
         else:
-            ctx = get_apply_player_context()
-            prob, blocked = direct_apply_view(r["id"], ctx)
-            label, _ = _prob_label(prob, blocked, direct_apply_scale(ctx))
+            prob, blocked, _sc = self._view(r["id"])
+            label, _ = _prob_label(prob, blocked, _sc)
             self.detail_lbl.setText(f"{r['name']} ({r['country']}, {r['grade']}급 {r['tier']}부) "
                                      f"— 예상 성공 가능성: {label} (약 {prob*100:.0f}%)")
         self.apply_btn.setEnabled(get_apply_attempts_left() > 0)
@@ -346,6 +383,8 @@ class ApplyWindow(QDialog):
             return
         team_name = next((r["name"] for r in self._rows if r["id"] == self._selected_team_id), "그 팀")
         success, prob, offer = apply_to_team(self._selected_team_id)
+        self._ctx = None              # [2026-11-21] 지원하면 "이미 지원함"·남은 횟수가 바뀌므로 캐시를 비운다
+        self._view_cache.clear()
         self._refresh_attempts()
 
         if success and offer:

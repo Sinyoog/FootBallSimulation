@@ -279,7 +279,10 @@ def validate_squad_tables():
         df = sum(t.get(c, 0) for c in _DF_CATS)
         mf = sum(t.get(c, 0) for c in _MF_CATS)
         fw = sum(t.get(c, 0) for c in _FW_CATS)
-        if C.FORMATION_SLOTS[f].count("CB") >= 3:
+        _exc = getattr(C, "OLYMPIC_SQUAD_RULE_EXCEPT", {}).get(f)
+        if _exc is not None:
+            want = tuple(_exc)   # constants의 명시적 예외(3-3-2-2 중앙형 DF6·MF6·FW4)
+        elif C.FORMATION_SLOTS[f].count("CB") >= 3:
             want = (7, 5, 4)
             assert t.get("CB", 0) == 4 and t.get("WB", 0) == 3, f"{f}: 백3·백5는 CB4 WB3"
         elif f == "4-2-4":
