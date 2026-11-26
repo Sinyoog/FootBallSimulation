@@ -1299,10 +1299,10 @@ def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost
         발상(포지션 적합도 페널티를 OVR에서 뺀다)."""
         from constants import POSITION_COMPAT
         compat = POSITION_COMPAT.get(p.get("position"), [p.get("position")])
-        if p.get("sub_pos") and p.get("sub_pos") == slot:
-            # [2026-10 주포·부포] 부포 슬롯 = OVR −1(로스터에 sub_pos가 붙은 클럽 선수만)
+        if (p.get("sub_pos") and p.get("sub_pos") == slot) or (p.get("sub_pos2") and p.get("sub_pos2") == slot):
+            # [2026-10 주포·부포] 부포 슬롯 = OVR −1(로스터에 sub_pos가 붙은 클럽 선수만) — [2026-11-25] 두 번째 부포도
             import sub_positions as _subp_t
-            return (p.get("ovr") or 50) - _subp_t.sub_abs_penalty(_SLOT_PEN[1])
+            return (p.get("ovr") or 50) - _subp_t.sub_abs_penalty(_SLOT_PEN[1], p.get("position"), slot)
         try:
             idx = compat.index(slot)
         except ValueError:

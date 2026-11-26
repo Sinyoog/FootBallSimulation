@@ -310,10 +310,10 @@ def slot_competition(conn, team_id, formation, p):
     primary = p.get("position") or "CM"
     try:
         import sub_positions as _subp
-        sub = _subp.my_sub()
+        sub = _subp.my_subs()           # [2026-11-25 SUB_POS_V2] 부포 전부(꺼져 있으면 예전 1개)
     except Exception:
-        sub = None
-    mine = {primary} | ({sub} if sub else set())
+        sub = ()
+    mine = {primary} | set(sub or ())
     my_slots = [s for s in slots if s in mine]
     if not my_slots:
         mine = set(POSITION_COMPAT.get(primary, [primary])[:2])
@@ -694,11 +694,11 @@ def _field_pos_for(formation, p):
         primary = p.get("position", "CM")
         compat = POSITION_COMPAT.get(primary, [primary])
         import sub_positions as _subp
-        my_sub = _subp.my_sub()
+        my_sub = _subp.my_entry()       # [2026-11-25 SUB_POS_V2] 2개면 튜플
         from constants import SUB_POS_RANK as _SPR_l   # [2026-10] 부포 = OVR −1 → 순위 0과 1 사이
         best_pos, best_rank, best_found = primary, 0, 999
         for slot in slots:
-            if my_sub and slot == my_sub:
+            if my_sub and _subp.is_sub_slot(my_sub, slot):
                 rank = _SPR_l
             elif slot in compat:
                 rank = compat.index(slot)

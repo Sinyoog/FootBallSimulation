@@ -421,17 +421,56 @@ def top1_paths(g):
     return out
 
 
-def apply_top1_gate(top, paths_of):
+# [2026-11-26 신설, 신민용 확정 — A-3] 1위 자격 예외 — 필터 적용 전 순서(상위 3명 경쟁까지 거친 순서)의 1위에게만
+#   자격을 추가로 인정한다(둘 중 하나라도 충족하면). 기존 자격 경로·점수·경쟁 순서·Top10·Top30 선정은 그대로.
+#   예외-리그우승(A-1): 그 1위가 5대 리그 1부 우승팀 소속(top1_paths 입력 big5_champ와 같은 판정).
+#   예외-개인압도(A-2): 그 1위의 개인 점수 − 같은 순서 Top10 안 다른 선수 중 개인 점수 최고 ≥ TOP1_EXC_GAP.
+#   20시즌 측정(시드 105·106): 필터가 점수 1위를 막은 3건(105-2004·106-2008 → 리그우승, 106-2007 → 개인압도)만
+#   바뀌고 나머지 17시즌·Top10·Top30 구성은 그대로. 격차 기준은 0.75~1.0이 같은 결과라 보수적으로 1.0(추가 측정 후 확정).
+TOP1_EXC_GAP = 1.0
+TOP1_EXC_POOL = 10
+TOP1_PATH_DESC.update({
+    "예외-리그우승": "예외 5대 리그 우승팀 소속(필터 전 1위)",
+    "예외-개인압도": f"예외 개인 점수가 Top{TOP1_EXC_POOL} 다른 선수보다 {TOP1_EXC_GAP:.2f} 이상 높음(필터 전 1위)",
+})
+
+
+def top1_exception_paths(top, g_first):
+    """필터 전 순서 top의 1위에게 붙는 예외 경로 목록(빈 목록 = 예외 없음). g_first = 그 1위의 top1_paths 입력(dict).
+    top 항목은 'personal'(개인 점수)을 가져야 개인압도를 본다(없으면 개인압도는 판정하지 않음)."""
+    out = []
+    if not top:
+        return out
+    if (g_first or {}).get("big5_champ"):
+        out.append("예외-리그우승")
+    p0 = top[0].get("personal")
+    rest = [e.get("personal") for e in top[1:TOP1_EXC_POOL] if e.get("personal") is not None]
+    if p0 is not None and rest and p0 - max(rest) >= TOP1_EXC_GAP - 1e-9:
+        out.append("예외-개인압도")
+    return out
+
+
+def apply_top1_gate(top, paths_of, exception_of=None):
     """Top30(점수 순) → (새 순서 리스트, 1위의 자격 경로 목록). paths_of(entry) = top1_paths 결과.
     1위가 자격이 있으면 그대로, 없으면 자격자 중 가장 앞(점수 최고)을 맨 앞으로 — 나머지 순서 유지.
-    자격자가 아무도 없으면 그대로(경로 목록 빈 값). top은 바꾸지 않는다."""
+    자격자가 아무도 없으면 그대로(경로 목록 빈 값). top은 바꾸지 않는다.
+    [2026-11-26] exception_of(lst) = 1위(lst[0])의 예외 경로 목록(top1_exception_paths) — 1위가 기존 자격이 없을 때만
+    보고, 예외가 있으면 1위 그대로. None이면 예전과 완전히 같다."""
     lst = list(top)
     for i, e in enumerate(lst):
         p = paths_of(e)
         if p:
             if i == 0:
                 return lst, p
+            if exception_of is not None:
+                x = exception_of(lst)
+                if x:
+                    return lst, x
             return [e] + lst[:i] + lst[i + 1:], p
+    if lst and exception_of is not None:
+        x = exception_of(lst)
+        if x:
+            return lst, x
     return lst, []
 
 

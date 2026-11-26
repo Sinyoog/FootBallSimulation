@@ -31,6 +31,8 @@ from database import (get_conn, get_game_start_year, TEAM_POSITIONS,
                        get_ai_player_custom_names)
 from constants import ai_player_code, FORMATION_SLOTS
 from sub_positions import get as _subp_get   # [2026-10 주포·부포] 부포 표시(스위치 OFF면 항상 None)
+from sub_positions import (get_all as _subp_get_all, display_subs as _subp_display,   # [2026-11-25 부포 2개]
+                           sub_label as _subp_label, TIP_CROSS as _SUBP_TIP_CROSS, TIP_SAME as _SUBP_TIP_SAME)
 from game_engine import is_hard_mode as _ge_is_hard_mode, is_easy_mode as _ge_is_easy_mode, fmt_money
 # [2026-10 성능, 신민용 리포트: "AI 인물 100만 명 넘으니 세계 기록실 딜레이"] 난이도 확인은
 # 매번 get_player()(my_player 전체 행 SELECT + dict 변환)를 부른다 — 목록 한 줄마다 불려서
@@ -117,6 +119,54 @@ class _FitColumnsFilter(QObject):
             tbl = obj
             QTimer.singleShot(0, lambda t=tbl: _fit_columns_now(t))
         return False
+
+
+class _FillWidthFilter(QObject):
+    """[2026-11-26 신설, 신민용 리포트: "선수 검색 소속팀 대회 기록 — 좌우 휠이 생길 이유가 없는데 생긴다, 사이즈를
+    맞춰야 할 듯"] 칸 폭이 전부 고정값(합 1,150px + 격자선)이라 오른쪽 영역이 그보다 조금이라도 좁으면(바깥 세로
+    스크롤바 몫 등) 몇 px 때문에 가로 스크롤바가 생겼다. 표 크기가 바뀌거나 처음 보일 때 기본 폭 합보다 넓으면 남는 폭을
+    정해 둔 칸(tbl._fill_flex — (칸, 비율))에 나눠 표를 뷰포트 폭에 딱 맞추고, 조금 좁으면 여유 있는 칸(tbl._fill_min —
+    {칸: 최소 폭})을 최소 폭까지만 줄여 맞춘다. 그보다 좁으면 최소 폭으로 두고 예전처럼 가로 스크롤(2026-08 "글자가 잘리는
+    대신 스크롤" 원칙 유지). 폭이 바뀌면 tbl._fill_after(줄 높이 다시 재기)를 부른다."""
+    def eventFilter(self, obj, ev):
+        if ev.type() in (QEvent.Type.Resize, QEvent.Type.Show):
+            QTimer.singleShot(0, lambda t=obj: _fill_width_now(t))
+        return False
+
+
+def _fill_width_now(tbl):
+    try:
+        base = tbl._fill_base
+        flex = tbl._fill_flex
+        mins = getattr(tbl, "_fill_min", {})
+        extra = tbl.viewport().width() - sum(base.values())
+        want = dict(base)
+        if extra > 0:
+            wsum = float(sum(w for _c, w in flex)) or 1.0
+            given = 0
+            for i, (c, w) in enumerate(flex):
+                add = (extra - given) if i == len(flex) - 1 else int(extra * w / wsum)
+                given += add
+                want[c] = base[c] + add
+        elif extra < 0 and mins:
+            slack = {c: max(0, base[c] - m) for c, m in mins.items()}
+            need = min(-extra, sum(slack.values()))
+            tot = float(sum(slack.values())) or 1.0
+            cut = 0
+            cols = sorted(slack)
+            for i, c in enumerate(cols):
+                d = (need - cut) if i == len(cols) - 1 else int(need * slack[c] / tot)
+                cut += d
+                want[c] = base[c] - d
+        changed = False
+        for c, wd in want.items():
+            if tbl.columnWidth(c) != wd:
+                tbl.setColumnWidth(c, wd)
+                changed = True
+        if changed and getattr(tbl, "_fill_after", None):
+            tbl._fill_after()
+    except (RuntimeError, AttributeError):
+        pass   # 표가 이미 닫힘
 
 
 class _RowRefreshFilter(QObject):
@@ -2257,6 +2307,7 @@ def _fetch_quick_player(player_id):
             "nationality": me["nationality"] or "",
             "is_retired": False,
             "sub_position": _subp_get(player_id),
+            "sub_positions": _subp_display(player_id, me["position"] or ""),   # [2026-11-25] 부포 2개
             "age": me["age"],
             "retirement_year": None,
         }
@@ -2287,6 +2338,7 @@ def _fetch_quick_player(player_id):
         "is_retired": is_retired,
         # [2026-10 주포·부포] 부포(없으면 None) — 간단 변경 창의 "포지션(부포)" 줄
         "sub_position": _subp_get(player_id),
+        "sub_positions": _subp_display(player_id, row["position"] or ""),   # [2026-11-25] 부포 2개
         "age": row["age"],
         "retirement_year": row["retirement_year"],
     }
@@ -2490,7 +2542,9 @@ class QuickPlayerEditPopup(QDialog):
             # [2026-11 신민용 요청] 순서: 포지션(당시) → 포지션(주포) → 포지션(부포).
             ("포지션(당시)", (pl.get("ctx_position", "") or "").strip() or "-"),
             ("포지션(주포)", _pos or "-"),
-            ("포지션(부포)", pl.get("sub_position") or "-"),
+            # [2026-11-25 신민용 요청: "부포창을 하나 더 늘려서"] 부포 1·2 — 같은 칸 부포는 "(전술 활용)"
+            # [2026-11-26 신민용 요청: "상자 절반으로 나눠서 좌측부터"] 한 줄 "포지션(부포)" — 값 칸 반반(ui.sub_split)
+            ("포지션(부포)", " | ".join(_subp_label(*_sub_at(pl, _i)) for _i in range(2) if _sub_at(pl, _i)[0]) or "-"),
         ]
         if not is_hard_mode():
             _ctx_ovr = pl.get("ctx_ovr")
@@ -2557,8 +2611,12 @@ class QuickPlayerEditPopup(QDialog):
                 if label == "포지션(주포)":
                     label_item.setToolTip("지금 이 선수의 주포지션(ai_players.position)")
                 elif label == "포지션(부포)":
-                    label_item.setToolTip("2시즌 동안 이 자리에서 뛰어 얻은 부포지션 — 부포에서는 "
-                                          "OVR이 1 낮은 것과 같습니다(없으면 -)")
+                    # [2026-11-26] 반반 칸 — 왼쪽 부포 1·오른쪽 부포 2, 칸 절반에 마우스를 올리면 그 부포 설명
+                    from ui import sub_split as _ssplit
+                    _ssplit.apply(value_item, [_sub_at(pl, 0), _sub_at(pl, 1)], color="#cccccc",
+                                  empty_color="#777777")
+                    label_item.setToolTip("왼쪽 = 부포 1, 오른쪽 = 부포 2 (* = 같은 칸 부포, 전술 활용) — "
+                                          "부포에서는 OVR이 1 낮은 것과 같습니다")
                 elif label == "나이(당시)":
                     _cy = pl.get("ctx_year")
                     label_item.setToolTip(
@@ -2591,6 +2649,11 @@ class QuickPlayerEditPopup(QDialog):
                 _it.setFlags(_it.flags() & ~Qt.ItemFlag.ItemIsEditable)
             tbl.setItem(i, 0, label_item)
             tbl.setItem(i, 1, value_item)
+        try:   # [2026-11-26] 부포 반반 칸 그리기(SPLIT 값이 없는 칸은 기본 그리기 그대로)
+            from ui import sub_split as _ssplit
+            tbl.setItemDelegateForColumn(1, _ssplit.SubSplitDelegate(tbl))
+        except Exception:
+            pass
         tbl.horizontalHeader().setStretchLastSection(True)
         tbl.setFixedHeight(22 * len(info_rows) + 4)
         # [2026-11-02 신설, 신민용 요청: "창 크기를 가장 긴 글자 기준으로 — '프리메라 페데라시온 (3부)'가 잘린다"]
@@ -4939,7 +5002,7 @@ class WorldBrowserWindow(QDialog):
     _POS_COL_W = 46
     # [2026-10 신설, 신민용 요청: "선수 검색에도 포지션이 주 포지션 | 부 포지션"] 선수 검색 목록의
     # 포지션 칸은 "CDM | CAM"(가장 긴 경우)까지 들어가야 해서 이 목록 전용으로 넓힌다.
-    _POS_SUB_COL_W = 92
+    _POS_SUB_COL_W = 128   # [2026-11-25] "주포 | 부포 | 부포"(부포 2개)까지 — 92 → 128(+36)
     # [2026-09 축소, 신민용 요청: "앞에 🇦🇷 이런거 줄어든 만큼 좌측
     # 공간을 좀 줄여서 우측을 더 활용할 수 있게 해줘"] 국기 이모지
     # (+뒤 공백)가 빠지면서 이 칸에 필요한 폭이 그만큼 줄었다 —
@@ -7949,7 +8012,7 @@ class WorldBrowserWindow(QDialog):
         # 주발(4번)이 끼면서 OVR 5번·소속팀 6번·소속팀 국가 7번으로 밀린다
         # — 아래 헤더 클릭(국적 1/OVR 5)·파란 헤더·소속팀 복사 칸 인덱스도
         # 같이 옮겼다.
-        self.player_detail_tbl = QTableWidget(0, 10)   # [2026-10] 10번째 "군대" 칸(한국 선수만 보임)
+        self.player_detail_tbl = QTableWidget(0, 10)   # [2026-10] 10번째 "군대" 칸(한국 선수만 보임) [2026-11-26] 부포는 한 칸 반반
         # [2026-10 신민용 요청: "포지션을 포지션(주포) | 포지션(부포) 두 칸으로"] 9→10칸 — 주포 3번·부포 4번,
         # 주발 5번·OVR 6번·소속팀 7번·소속팀 국가 8번·군대 9번으로 하나씩 밀린다(헤더 클릭·파란 헤더·
         # 소속팀 셀 클릭·소속팀 복사 칸·군대 칸 숨김 인덱스도 같이 옮겼다).
@@ -7995,6 +8058,10 @@ class WorldBrowserWindow(QDialog):
         # 대신 QTableWidgetItem을 직접 넣어야 "이름" 칸에 클릭 툴팁을
         # 붙일 수 있다(색 자체는 위 ::section:first QSS가 담당 — 아이템
         # foreground는 QSS에 가려 무시되므로 굳이 다시 안 건다).
+        # [2026-11-25 신민용 요청] 부포 2개 — 포지션(부포 1)·포지션(부포 2). 주발 6·OVR 7·소속팀 8·소속팀 국가 9·군대 10으로
+        # 하나씩 밀린다(헤더 클릭·파란 헤더·소속팀 셀 클릭·소속팀 복사 칸·군대 칸 숨김 인덱스도 같이 옮겼다).
+        # [2026-11-26 신민용 요청: "상자 절반으로 나눠서"] 부포는 다시 한 칸 "포지션(부포)" — 칸 안을 반반(부포 1 | 부포 2)으로
+        # 그린다(ui.sub_split). 열 번호도 2026-11-25 이전 값(주발 5·OVR 6·소속팀 7·소속팀 국가 8·군대 9)으로 되돌렸다.
         _detail_headers = ["이름", "국적", "나이", "포지션(주포)", "포지션(부포)", "주발", "OVR", "소속팀",
                            "소속팀 국가", "군대"]
         for _col, _label in enumerate(_detail_headers):
@@ -8005,6 +8072,8 @@ class WorldBrowserWindow(QDialog):
                 _hitem.setToolTip("클릭하면 이 선수의 국적을 직접 지정할 수 있습니다 (쉬움 난이도 전용)")
             elif _col == 6 and is_easy_mode():
                 _hitem.setToolTip("클릭하면 이 선수의 한계 스탯(OVR)을 조정할 수 있습니다 (쉬움 난이도 전용)")
+            elif _col == 4:
+                _hitem.setToolTip("왼쪽 = 부포 1, 오른쪽 = 부포 2 (* = 같은 칸 부포, 전술 활용)")
             elif _col == 7:
                 _hitem.setToolTip("감독이 된 선수면 클릭하면 감독 검색에서 그 감독을 엽니다")
             self.player_detail_tbl.setHorizontalHeaderItem(_col, _hitem)
@@ -8017,6 +8086,11 @@ class WorldBrowserWindow(QDialog):
         # 그 감독을 검색한 것처럼"] 소속팀 칸(6번) 셀 클릭도 헤더 클릭과 같이 처리한다.
         self.player_detail_tbl.cellClicked.connect(self._on_player_detail_cell_clicked)
         _enable_plain_copy(self.player_detail_tbl)
+        try:   # [2026-11-26] 포지션(부포) 칸(4번)을 반반(부포 1 | 부포 2)으로 그린다
+            from ui import sub_split as _ssplit
+            self.player_detail_tbl.setItemDelegateForColumn(4, _ssplit.SubSplitDelegate(self.player_detail_tbl))
+        except Exception:
+            pass
         self.player_detail_tbl.hide()
         right_lay.addWidget(self.player_detail_tbl)
 
@@ -8164,7 +8238,7 @@ class WorldBrowserWindow(QDialog):
         right_lay.addWidget(scroll, 1)
 
         split.addWidget(right)
-        split.setSizes([464, 876])   # [2026-10] 포지션 칸 "주포 | 부포" 확장(+46)
+        split.setSizes([500, 840])   # [2026-10] 포지션 칸 "주포 | 부포" 확장(+46) [2026-11-25] 부포 2개(+36)
         split.setStretchFactor(0, 0)
         split.setStretchFactor(1, 1)
         lay.addWidget(split, 1)
@@ -10780,8 +10854,8 @@ class WorldBrowserWindow(QDialog):
         return [
             {"text": code, "width": self._NAME_COL_W, "color": _name_color, "bold": True},
             # [2026-10 주포·부포] 부포가 있으면 "주포 | 부포"(내 선수 player_id -1도 같은 표로 조회)
-            {"text": ((f"{pl.get('position') or ''} | {_subp_get(pl.get('player_id'))}"
-                       if _subp_get(pl.get("player_id")) else (pl.get("position") or ""))),
+            # [2026-11-25] 부포 2개면 "주포 | 부포1 | 부포2"
+            {"text": " | ".join([pl.get("position") or ""] + list(_subp_get_all(pl.get("player_id")))),
              "width": self._POS_SUB_COL_W,
              "color": "#aaddff", "size": 11, "bold": True, "align": Qt.AlignmentFlag.AlignCenter},
             {"text": nat_text, "width": self._NAT_COL_W, "color": "#aaddff"},
@@ -11124,7 +11198,7 @@ class WorldBrowserWindow(QDialog):
             self._open_ai_rename_dialog(pid)
             return
         if section == 7:
-            # [2026-10 신설] 소속팀 헤더(주포·부포 분리로 6→7) — 감독이 된 선수면 감독 검색으로(아니면 무시).
+            # [2026-10 신설] 소속팀 헤더(주포·부포 분리로 6→7) — 감독이 된 선수면 감독 검색으로.
             self._open_player_detail_manager()
             return
         # [2026-09] 주발 칸 추가로 OVR이 4→5번으로 밀렸다. [2026-10] 주포·부포 분리로 5→6번.
@@ -11235,7 +11309,9 @@ class WorldBrowserWindow(QDialog):
             # [2026-10 주포·부포 → 2026-10 분리, 신민용 요청: "포지션(주포) | 포지션(부포)"] 예전엔 한 칸에
             # "CM | CDM"으로 합쳤다 — 이제 두 칸. 부포가 없으면 "-".
             (d.get("position") or "-", "#aaddff", False),
-            (d.get("sub_position") or "-", "#aaddff" if d.get("sub_position") else "#666666", False),
+            # [2026-11-25 신민용 요청] 부포 1·2 두 칸 — 같은 칸 부포는 "(전술 활용)"
+            # [2026-11-26] 부포 한 칸 반반 — 아래에서 ui.sub_split로 두 절반 값을 싣는다
+            ("-", "#aaddff", False),
             # [2026-09 신설, 신민용 요청] 주발 — 포지션과 OVR 사이.
             (d.get("foot") or "-", "#cccccc", False),
             # [2026-08 신설, 신민용 요청: "어려움 모드일 때... 그 선수를
@@ -11270,6 +11346,9 @@ class WorldBrowserWindow(QDialog):
             # 코드가 빠져 있어서(다른 셀들처럼 원래 장식이 없는 텍스트라
             # 문제가 없었을 뿐) 실제로는 화면에 보이는 전체 문자열이
             # 그대로 복사되고 있었다 — 팀명만 별도로 채워준다.
+            if col == 4:   # [2026-11-26] 부포 칸 — 반반(왼쪽 부포 1·오른쪽 부포 2)
+                from ui import sub_split as _ssplit
+                _ssplit.apply(item, [_sub_at(d, 0), _sub_at(d, 1)], color="#aaddff", empty_color="#666666")
             if col == 7:  # 소속팀 칸 (주발 추가로 5→6, 주포·부포 분리로 6→7)
                 _clean = d.get("team_name") if d.get("team_id") and not d.get("is_retired") else None
                 if _clean:
@@ -11418,6 +11497,17 @@ class WorldBrowserWindow(QDialog):
         # 일치하지만, 최초 렌더 타이밍 차이에 대비).
         tbl.horizontalHeader().sectionResized.connect(
             lambda idx, _old, new: award_tbl.setColumnWidth(idx, new))
+        # [2026-11-26 신민용 리포트: 폭이 조금 모자라 가로 스크롤바가 생긴다] 오른쪽 영역이 기본 폭 합보다 넓으면 남는 폭을
+        # 리그(3) · 국내컵(1) · 소속팀(1) 비율로 나눠 표를 영역 폭에 맞춘다(_FillWidthFilter). award_tbl은 바로 위
+        # sectionResized 연결로 같은 폭을 따라간다.
+        tbl._fill_base = {c: tbl.columnWidth(c) for c in range(tbl.columnCount())}
+        tbl._fill_flex = [(5, 3), (6, 1), (1, 1)]
+        # 조금 좁을 때 줄일 수 있는 칸과 최소 폭(합 80px까지 흡수) — 소속팀·클럽 대항전·슈퍼컵·클럽 월드컵·국내슈퍼컵
+        tbl._fill_min = {1: self._LEAGUE_COL_W - 18, 7: self._CL_COL_W_WIDE - 12, 8: self._SC_COL_W - 20,
+                         9: self._RARE_COMP_COL_W - 10, 10: self._DSC_COL_W - 20}
+        tbl._fill_after = lambda t=tbl: (self._resize_self_sizing_table(t) if t.rowCount() else None)
+        tbl._fill_filter = _FillWidthFilter(tbl)
+        tbl.installEventFilter(tbl._fill_filter)
         # [2026-08 신설, 신민용 요청: "가로 스크롤을 만들어달라"] 두 표가
         # 이제 각자 자기 가로 스크롤바를 가질 수 있게 됐는데(_make_self_
         # sizing_table이 AsNeeded로 켰음), "수상" 요약 행(award_tbl)은
@@ -11909,7 +11999,8 @@ class WorldBrowserWindow(QDialog):
                 player_team_name = entry.get("_main_team_name")
                 player_position = entry.get("_main_position") or current_position
             else:
-                player_team_name = _team_name_for_year(entry["year"])
+                # [2026-11-26] 가상 유스 줄은 그 해 나이에 맞는 U-18/U-21 이름(world_browser._youth_stage_name)
+                player_team_name = entry.get("_youth_team_name") or _team_name_for_year(entry["year"])
                 # [2026-08 신설] 시즌별 실제 포메이션 슬롯 아카이브가 있으면
                 # 그걸 최우선으로 — 이적 시점 등록 포지션(_position_for_year)
                 # 보다 정확하다(예: 등록은 CB인데 그 시즌 스쿼드 사정상
@@ -12023,6 +12114,8 @@ class WorldBrowserWindow(QDialog):
             # 역할(entry["_h2_role"] — world_browser._lineup_h2_role)을 쓴다.
             role_at_year = (entry.get("_half_role") if entry.get("_is_half")
                              else entry.get("_h2_role") or role_checkpoints.get(entry["year"]))
+            if entry.get("_is_youth"):
+                role_at_year = None   # [2026-11-26] 유스(U-21) 행 — 1군 역할이 없다(그 해 역할 기록은 승격 뒤 1군 기준일 수 있음)
             if role_at_year:
                 role_item = QTableWidgetItem(role_at_year)
                 role_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -20588,3 +20681,12 @@ class TournamentDetailDialog(QDialog):
 
         lay.addLayout(grid)
         return box
+
+
+def _sub_at(d, i):
+    """[2026-11-25 부포 2개] 선수 정보 dict의 i번째 부포 (포지션, 종류) — 없으면 (None, None).
+    sub_positions가 없던 예전 dict면 sub_position 하나만 본다."""
+    lst = d.get("sub_positions")
+    if lst is None:
+        lst = [(d.get("sub_position"), None)] if d.get("sub_position") else []
+    return lst[i] if i < len(lst) else (None, None)

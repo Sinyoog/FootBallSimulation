@@ -637,6 +637,47 @@ class OfferWindow(QDialog):
         cache[team_id] = res
         return res
 
+    def _current_season_result(self, team_id):
+        """[2026-11-26 신설] 리그가 진행 중일 때(개막 FIRST_HALF_START 뒤 ~ 리그 종료 postseason 전) 그 팀의 이번 시즌
+        지금 순위 — 게임 순위표(game_engine.get_league_standings_by_team, 그 시즌 실제로 뛴 리그)와 같은 계산.
+        반환 {year, league_name, league_tier, rank, teams, record, pts, first_half} 또는 None(진행 중이 아님·경기 없음·
+        조회 실패 — 호출부는 예전처럼 지난 시즌을 보여 준다). 창마다 팀별로 1번만 계산."""
+        cache = self.__dict__.setdefault("_cur_season_cache", {})
+        if team_id in cache:
+            return cache[team_id]
+        out = None
+        week, year = self._game_week_year()
+        try:
+            from constants import FIRST_HALF_START, SECOND_HALF_START, SEASON_PHASES
+            if team_id is not None and year and FIRST_HALF_START < week < SEASON_PHASES["postseason"][0]:
+                from game_engine import get_state, get_league_standings_by_team, _team_league_id_for_season
+                from database import get_conn
+                season = (get_state() or {}).get("current_season")
+                conn = get_conn()
+                try:
+                    rows = get_league_standings_by_team(team_id, conn=conn, season=season)
+                    c = conn.cursor()
+                    lid = _team_league_id_for_season(c, team_id, season) if season is not None else None
+                    if lid is None:
+                        _t = c.execute("SELECT league_id FROM teams WHERE id=?", (team_id,)).fetchone()
+                        lid = _t["league_id"] if _t else None
+                    lg = c.execute("SELECT name, tier FROM leagues WHERE id=?", (lid,)).fetchone() if lid else None
+                finally:
+                    conn.close()
+                for i, r in enumerate(rows or []):
+                    if r["id"] == team_id:
+                        if (r["wins"] or 0) + (r["draws"] or 0) + (r["losses"] or 0) > 0:
+                            out = {"year": year, "league_name": lg["name"] if lg else "", "league_tier": lg["tier"] if lg else "?",
+                                   "rank": i + 1, "teams": len(rows),
+                                   "record": f"{r['wins']}승 {r['draws']}무 {r['losses']}패", "pts": r["pts"],
+                                   "first_half": week < SECOND_HALF_START}
+                        break
+        except Exception as e:
+            print(f"[OFFER] 이번 시즌 순위 조회 실패(지난 시즌 표시): {e}")
+            out = None
+        cache[team_id] = out
+        return out
+
     def _kv_row(self, grid, r, key, value, need, val_style="color:#dddddd;font-size:12px;",
                 rich=False, tip=""):
         # [2026-11-13 신민용: "좌측 칸 가운데 정렬, 색을 굳이 회색으로 할 필요 없다"] 키 칸은 값(두 줄일 수
@@ -743,10 +784,39 @@ class OfferWindow(QDialog):
         # 그에 맞게, 강등도"] 예전 rank_info 글자(오퍼 생성 때 만든 것)는 이 팀이 그 시즌 다른 리그에 있었으면
         # 승격/강등 사실만 남았다. 이제 세계 기록실과 같은 계산으로 그 시즌 실제로 뛴 리그의 순위를 직접 구한다.
         res = self._last_season_result(offer.get("team_id"))
-        ttl = QLabel("지난 시즌" if not res else f"지난 시즌 ({res['year']})")
-        ttl.setStyleSheet("color:#888888;font-size:11px;")
-        lay.addWidget(ttl)
-        if res:
+        # [2026-11-26 신민용 요청: "시즌 중간 비시즌(겨울) 오퍼 때 작년 순위표 말고 상반기 순위표로"] 리그가 진행 중이면
+        # (개막 후 ~ 리그 종료 전) 이번 시즌 지금 순위표를 주 표시로 하고, 지난 시즌 성적은 아래 작은 한 줄로 내린다.
+        cur = self._current_season_result(offer.get("team_id"))
+        if cur is not None:
+            ttl = QLabel(f"이번 시즌{' 상반기' if cur['first_half'] else ''} ({cur['year']})")
+            ttl.setStyleSheet("color:#888888;font-size:11px;")
+            lay.addWidget(ttl)
+            lay.addWidget(self._wrap_label(
+                f"{_esc(cur.get('league_name') or '')} ({cur.get('league_tier')}부)",
+                "color:#aaaaaa;font-size:11px;", need))
+            lay.addWidget(self._wrap_label(
+                f"<span style='color:#dddddd;font-weight:bold;font-size:13px'>{cur['rank']}위</span>"
+                f"<span style='color:#777777'> / {cur['teams']}팀</span>"
+                f"<span style='color:#aaaaaa'>  ·  {_esc(cur['record'])} {cur['pts']}점</span>",
+                "font-size:11px;", need, rich=True))
+            if res:
+                _tag, _col = self._SEASON_RESULT.get(res.get("result") or "", ("", "#999999"))
+                if res.get("champion"):
+                    _tag, _col = "리그 우승", "#ffd700"
+                lay.addWidget(self._wrap_label(
+                    f"<span style='color:#777777'>지난 시즌 ({res['year']})  </span>"
+                    f"<span style='color:{_col}'>{res['rank']}위</span>"
+                    f"<span style='color:#777777'> / {res.get('teams') or '?'}팀"
+                    f"{('  ' + _esc(_tag)) if _tag else ''}</span>",
+                    "font-size:10px;", need, rich=True))
+            res = None   # 아래 지난 시즌 블록은 건너뛴다
+        else:
+            ttl = QLabel("지난 시즌" if not res else f"지난 시즌 ({res['year']})")
+            ttl.setStyleSheet("color:#888888;font-size:11px;")
+            lay.addWidget(ttl)
+        if cur is not None:
+            pass
+        elif res:
             _tag, _col = self._SEASON_RESULT.get(res.get("result") or "", ("", "#dddddd"))
             if res.get("champion"):
                 _tag, _col = "리그 우승", "#ffd700"
@@ -774,7 +844,7 @@ class OfferWindow(QDialog):
         # 겨울(시즌 도중) 오퍼면 이번 시즌 지금까지 성적(오퍼 생성 때 만든 rank_info)도 아래에 작게.
         _wk, _yr = self._game_week_year()
         from constants import FIRST_HALF_START, SEASON_PHASES as _SP
-        if FIRST_HALF_START < _wk <= _SP["second_half"][1]:
+        if cur is None and FIRST_HALF_START < _wk <= _SP["second_half"][1]:   # 위에서 이번 시즌을 못 구했을 때만(예전 표시)
             _cur = (offer.get("rank_info") or "").split("\n")[0].strip()
             if _cur and "작년" not in _cur:
                 lay.addWidget(self._wrap_label(f"이번 시즌  {_cur}", "color:#777777;font-size:10px;", need))

@@ -5621,6 +5621,11 @@ def init_db(load=True):
         import sub_positions as _subp
         _subp.ensure_table(c)
         _subp.clear()
+        # [2026-11-25 SUB_POS_V2] 켜져 있을 때만 새 표를 만들고, 처음이면 예전 부포를 옮긴 뒤(부포 1) 생성 판정이
+        # 안 된 선수에게 생성 부포를 빈 자리에만 넣는다(기존 세이브 일회성 변환). 꺼져 있으면 아무것도 안 한다.
+        if _subp.v2():
+            _subp.ensure_v2(c)
+            _subp.grant_innate_now(c, "load")
     except Exception as _e_subp:
         print(f"[SUB-POS] 부포 표 준비 실패: {_e_subp}")
     c.execute("CREATE TABLE IF NOT EXISTS ai_players_seed(id INTEGER PRIMARY KEY)")
@@ -8661,13 +8666,25 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False, start_year=None):
               "ai_transfer_log_archive",
               "ai_player_realstat_season"]:
         c.execute(f"DELETE FROM {t}")
+    # [2026-11-25 SUB_POS_V2] 새 부포 표·생성 판정 완료 표·변환 표시도 비운다(표가 없으면 무동작 — V2를 켠 적 없는 세이브).
+    try:
+        import sub_positions as _subp_v2r
+        _subp_v2r.reset_v2(c)
+    except Exception:
+        pass
     # [2026-11-22] 기록 화면 통산 장부 — player_id·team_id가 새 판에서 재사용되므로 비우고, 빈 장부를 유효로 표시한다.
     import record_ledger as _rl_reset
     _rl_reset.reset_empty(c)
     # [2026-10 신설] U-23 올림픽 전용 표 — tournament_id·player_id가 새 게임에서 재사용되므로
     # 반드시 비운다(이 목록의 "새 표 추가를 깜빡함" 재발 방지). 꺼져 있으면 표 자체가 없다.
     for _t in ("oly_reserve_cut", "oly_squad_meta", "oly_squad_roles", "oly_military_benefit",
-               "oly_team_managers", "oly_objectives"):   # [2026-10 2단계] U-23 감독 재임·목표
+               "oly_team_managers", "oly_objectives",   # [2026-10 2단계] U-23 감독 재임·목표
+               # [2026-11-26 버그수정, 신민용 리포트: "새 게임 시작하면 이전 데이터가 안 지워지는 것 같다"] 국대 선발
+               # v4.1 AI 상반기 추정 기록(intl_engine._v41_ai_half_stats — (선수, 연도) 키로 저장값이 있으면 다시
+               # 계산하지 않고 그대로 쓴다). player_id·연도가 새 판에서 재사용되므로 안 비우면 새 게임 국대 선발이
+               # 이전 판 선수 기록을 읽는다(실측: 10시즌 판 → 새 게임 후 92만 행·2010년까지 그대로 남음). 처음 쓸 때
+               # 만들어지는 표라 없을 수 있다.
+               "intl_half_stats"):
         try:
             c.execute(f"DELETE FROM {_t}")
         except sqlite3.OperationalError:
@@ -8752,8 +8769,10 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False, start_year=None):
         pass
     _rst_mark("팀/리그 원본 복원")
     _regenerate_ai_players(c, progress_cb=progress_cb, skip_generation=skip_ai_regen)
-    if not skip_ai_regen and _vy_rst.stage1():
-        _vy_rst.build_world(c, get_game_start_year())   # [2026-11-22 1단계] 가상 유스(대상 판정은 이 시점 기준으로 고정)
+    if not skip_ai_regen and _vy_rst.active():
+        # [2026-11-22 1단계] 가상 유스(대상 판정은 이 시점 기준으로 고정) [2026-11-26 VY_STANDALONE] 기본 게임 유스팀도
+        # (보유 범위 S 1~4·A 1~3·B 1~2·C 이하 1부, 클럽당 VY_SA_POOL명 — 이후 매 오프시즌 재평가)
+        _vy_rst.build_world(c, get_game_start_year())
     _rst_mark("선수단 재생성" + (" (건너뜀)" if skip_ai_regen else ""))
     _reset_formations_from_seed(c)
     _reset_club_strength(c)
@@ -12158,6 +12177,17 @@ def roll_foot(position, player_id, salt):
     return FOOT_BOTH
 
 
+def _sub_v2_grant(c):
+    """[2026-11-25 SUB_POS_V2] 주발 백필과 같은 자리(새 선수가 생기는 모든 경로가 거치는 곳)에서 생성 부포도 판정한다
+    — 주발이 정해진 뒤라야 발 규칙을 지킬 수 있다. V2가 꺼져 있으면 아무것도 안 한다(sub_positions.grant_innate_now)."""
+    try:
+        import sub_positions as _sp_g
+        if _sp_g.v2():
+            _sp_g.grant_innate_now(c, "feet")
+    except Exception as _e:
+        print(f"[SUB-POS V2] 생성 부포 판정 실패(계속 진행): {_e}")
+
+
 def assign_missing_feet(c=None):
     """foot이 아직 빈 ai_players 행에 결정적 주발을 채운다. 멱등이라
     몇 번을 불러도 결과가 같고, 이미 값이 있는 행은 건드리지 않는다.
@@ -12181,10 +12211,12 @@ def assign_missing_feet(c=None):
             "SELECT id, position FROM ai_players "
             "WHERE foot IS NULL OR foot=''").fetchall()
         if not rows:
+            _sub_v2_grant(c)
             return 0
         salt = get_foot_salt(c if not own else conn)
         payload = [(roll_foot(r["position"], r["id"], salt), r["id"]) for r in rows]
         c.executemany("UPDATE ai_players SET foot=? WHERE id=?", payload)
+        _sub_v2_grant(c)
         return len(payload)
     finally:
         if own:
@@ -13245,6 +13277,29 @@ def split_star_prob_by_position(p_world, p_elite, pos, context="starter"):
     return new_world, total - new_world
 
 
+def _wildcard_thin(team_cap, u):
+    """[2026-11-26 B안, 신민용+GPT 확정] 일반 신인 와일드카드 확률을 출신 리그 성장 상한(team_cap)별로 낮춘다 —
+    상한 80+ 1.5%(기존 그대로) · 70~79 0.5% · 70 미만 0.2%. 약한 리그에서도 극히 드물게 세계적 재능이 나올 가능성은
+    남기되, 성장할 환경이 없는 리그에 잠재 90+를 매년 수십 명씩 만들지 않는다(실측: 3년간 성장 상한 60 미만 리그의
+    잠재 90+ 211명 중 OVR 85 도달 0명). 와일드카드가 나오면 절대값 추첨 범위는 기존 그대로.
+    u는 이미 뽑은 0~0.015 난수 — u < 확률이면 와일드카드 유지(None), 아니면 일반 분기 offset(12~25)을 u에서 고르게
+    만들어 돌려준다(전용 계산 — 게임 난수를 더 뽑지 않음). 스위치 꺼짐이면 항상 None."""
+    import constants as _Cw
+    if not getattr(_Cw, "POT_WILDCARD_BY_CAP", False):
+        return None
+    base = 0.015
+    p = base
+    for lo, rate in getattr(_Cw, "POT_WILDCARD_CAP_RATES", ((80, 0.015), (70, 0.005), (0, 0.002))):
+        if team_cap >= lo:
+            p = rate
+            break
+    else:
+        p = getattr(_Cw, "POT_WILDCARD_CAP_RATES")[-1][1]
+    if p >= base or u < p:
+        return None
+    return 12 + min(13, int((u - p) / (base - p) * 14))
+
+
 def roll_potential_ovr(team_cap, kind=None):
     """kind: 'worldclass' | 'elite' | None(일반 — 벤치 포함 나머지 전부)."""
     if kind == "worldclass":
@@ -13262,7 +13317,8 @@ def roll_potential_ovr(team_cap, kind=None):
     elif kind == "elite":
         offset = random.randint(4, 10)
     else:
-        if random.random() < 0.015:
+        _u = random.random()
+        if _u < 0.015:
             # [2026-09 수정] 와일드카드: team_cap과 무관한 세계 공통 희귀
             # 분포에서 절대값을 뽑는다 — 소속팀/소속국의 team_cap이 아무리
             # 낮아도(한국 하위팀 포함) 극히 낮은 확률로 97+가 나올 수 있다.
@@ -13270,9 +13326,14 @@ def roll_potential_ovr(team_cap, kind=None):
             # 아니라 "team_cap 제약에서 풀려난 별도의 추첨"이라는 뜻) —
             # 호출부가 이미 max(ovr, roll_potential_ovr(...))로 감싸고
             # 있어 현재 OVR 밑으로 떨어지는 문제는 없다.
-            return max(1, min(99, _roll_global_wildcard_abs()))
-        else:
-            offset = random.randint(12, 25)
+            # [2026-11-26 B안] 출신 리그 성장 상한별 와일드카드 확률(POT_WILDCARD_BY_CAP) — 기존 추첨(_u·절대값 추첨)을
+            # 그대로 소비한 뒤 _u만으로 판정·대체하므로 게임 난수 흐름은 끔과 같다(_wildcard_thin 참고).
+            _wv = max(1, min(99, _roll_global_wildcard_abs()))
+            _thin = _wildcard_thin(team_cap, _u)
+            if _thin is not None:
+                return max(1, min(99, team_cap - _thin))
+            return _wv
+        offset = random.randint(12, 25)
     return max(1, min(99, team_cap - offset))
 
 

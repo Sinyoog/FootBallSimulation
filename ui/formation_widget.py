@@ -3710,16 +3710,21 @@ class PlayerStatPopup(QDialog):
         ]
         # [2026-10 주포·부포, 신민용 요청: "포메이션에서 ai선수 클릭할 때 주포 부포 이렇게 떠야"]
         # 부포가 있으면 "포지션" 줄을 "주포 | 부포"(예: ST | LW)로(내 선수는 id -1 또는 is_me로 조회).
+        # [2026-11-26 신민용 요청: "부포 표시하는 상자를 절반으로 나눠서 좌측부터 채우고"] 부포 최대 2개를 한 줄
+        # "포지션(부포)"의 값 칸 반반(왼쪽 부포 1·오른쪽 부포 2)으로 — 아래 표 그릴 때 ui.sub_split이 그린다.
+        # 부포 2개(SUB_POS_V2) 게임 코드가 없으면 예전처럼 부포 1개(왼쪽만 참).
         try:
             import sub_positions as _subp
+            from ui import sub_split as _ssplit
             _pid = pl.get("id")
-            _sub = pl.get("sub_pos") or (_subp.my_sub() if (pl.get("is_me") or _pid == _subp.MY_ID)
-                                         else (_subp.get(_pid) if isinstance(_pid, int) else None))
+            _is_me = bool(pl.get("is_me") or _pid == _subp.MY_ID)
+            _subs_disp = _ssplit.subs_of(_pid, pl.get("main_pos") or pl.get("position") or "", me=_is_me,
+                                         fallback=pl.get("sub_pos"))
         except Exception:
-            _sub = None
+            _subs_disp = [(pl.get("sub_pos"), None)] if pl.get("sub_pos") else []
         # [2026-11-17 변경, 신민용 요청: "RB | LWB 한 줄 말고 주포 RB, 그 아래 줄에 부포 LWB로"] 주포·부포를 두 줄로 나눈다.
-        # 부포가 없으면 주포 줄만 보인다. (행 위치는 아래 표를 그릴 때 라벨로 찾으므로 줄이 늘어도 편집 동작은 그대로.)
-        info_rows.append(("포지션(부포)", _sub or "-"))
+        # (행 위치는 아래 표를 그릴 때 라벨로 찾으므로 줄이 늘어도 편집 동작은 그대로.)
+        info_rows.append(("포지션(부포)", " | ".join(p for p, _k in _subs_disp[:2] if p) or "-"))
         age = pl.get("age")
         if age:
             info_rows.append(("나이", f"{age}세"))
@@ -3852,8 +3857,21 @@ class PlayerStatPopup(QDialog):
             else:
                 label_item.setForeground(QColor("#888"))
                 value_item.setForeground(QColor("#ccc"))
+                if label == "포지션(부포)":
+                    # [2026-11-26] 부포 반반 칸 — 같은 칸 부포는 "LM*", 칸 절반에 마우스를 올리면 설명
+                    try:
+                        from ui import sub_split as _ssplit
+                        _ssplit.apply(value_item, _subs_disp, color="#cccccc", empty_color="#777777")
+                        label_item.setToolTip("왼쪽 = 부포 1, 오른쪽 = 부포 2 (* = 같은 칸 부포, 전술 활용)")
+                    except Exception:
+                        pass
             info_tbl.setItem(i, 0, label_item)
             info_tbl.setItem(i, 1, value_item)
+        try:   # [2026-11-26] 부포 반반 칸 그리기(SPLIT 값이 없는 칸은 기본 그리기 그대로)
+            from ui import sub_split as _ssplit
+            info_tbl.setItemDelegateForColumn(1, _ssplit.SubSplitDelegate(info_tbl))
+        except Exception:
+            pass
         info_tbl.horizontalHeader().setStretchLastSection(True)
         info_tbl.setFixedHeight(22 * len(info_rows) + 4)
         if (_rename_pid is not None or self._ovr_edit_pid is not None

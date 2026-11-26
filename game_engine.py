@@ -306,7 +306,7 @@ def get_field_pos(p=None):
         # [2026-10 주포·부포] 내 부포 슬롯은 순위 SUB_POS_RANK(부포 = OVR −1 → 주포 다음, 호환 2순위 앞).
         # 부포가 없으면 sub_positions.best_slot이 예전 루프와 같은 결과를 낸다.
         import sub_positions as _subp
-        _my_sub = _subp.my_sub()
+        _my_sub = _subp.my_entry()      # [2026-11-25 SUB_POS_V2] 부포 2개면 튜플(1개면 예전 my_sub와 같은 값)
         if _my_sub:
             return _subp.best_slot(primary, _my_sub, slots)
         compat = POSITION_COMPAT.get(primary, [primary])
@@ -896,9 +896,11 @@ def calc_positional_ovr(primary_pos: str, stats: dict, field_pos: str, cap: int 
     # 그 값을 쓴다 — 부포를 얻었다고 오히려 낮아지는 일은 없게.
     rank = _position_mismatch_rank(primary_pos, field_pos)
     penalty = POSITION_MISMATCH_PENALTY[rank]
-    if sub_pos and field_pos == sub_pos:
-        from constants import SUB_POS_OVR_COST
-        return round(max(calc_ovr(primary_pos, stats, cap=cap) - SUB_POS_OVR_COST, base - penalty), 1)
+    if sub_pos and (field_pos in sub_pos if sub_pos.__class__ is tuple else field_pos == sub_pos):
+        # [2026-11-25 SUB_POS_V2] sub_pos가 (부포1, 부포2)여도 된다. 감점은 sub_positions.sub_cost(A안 = 예전 값).
+        import sub_positions as _subp_c
+        return round(max(calc_ovr(primary_pos, stats, cap=cap) - _subp_c.sub_cost(primary_pos, field_pos),
+                         base - penalty), 1)
     return round(base - penalty, 1)
 
 
@@ -1332,6 +1334,15 @@ def create_player(name: str, position: str, sub_role: str,
     conn.execute("""INSERT OR REPLACE INTO season_state(id,current_year,current_week,
                     current_season,phase) VALUES(1,?,1,1,'preseason')""",
                  (_start_year,))
+    # [2026-11-25 SUB_POS_V2] 새 게임: 월드 선수 + 내 선수에게 생성 부포를 판정한다(AI와 같은 규칙).
+    # 꺼져 있으면 아무것도 안 한다.
+    try:
+        import sub_positions as _subp_cp
+        if _subp_cp.v2():
+            _subp_cp.ensure_v2(conn)
+            _subp_cp.grant_innate_now(conn, "create_player")
+    except Exception as _e_cp:
+        print(f"[SUB-POS V2] 생성 부포 판정 실패(계속 진행): {_e_cp}")
     conn.commit()
     conn.close()
     # [2026-08 신설] get_state() 캐시가 이 함수 호출 전에 이미 채워져
@@ -6671,7 +6682,7 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None, opp_sot=Non
     import sub_positions as _subp
     _my_ovr   = calc_positional_ovr(p.get("position", "CM"), _stats_for_ovr, pos, cap=_ovr_cap,
                                      physical_trait=p.get("physical_trait"),
-                                     sub_pos=_subp.my_sub())   # [2026-10 주포·부포]
+                                     sub_pos=_subp.my_entry())   # [2026-10 주포·부포] [2026-11-25] 2개면 튜플
     my_score  = hs if is_home else as_
     opp_score = as_ if is_home else hs
     goals = assists = saves = 0
@@ -7334,16 +7345,18 @@ def _flush_team_rec(c, deltas: dict):
     )
 
 
-def _my_fair_salary(p, wealth, tier, country, team_name, team_id, year):
+def _my_fair_salary(p, wealth, tier, country, team_name, team_id, year, V=None):
     """[2026-10 신설, 신민용 확정] 내 선수 "적정 연봉" — 새 계약 연봉 규칙(economy.my_contract_salary)과
     같은 조건(B단계 곡선·리그 기준·검증도 V·나이 B안·구단 배율(명문×체급)·경제지수·상한)으로, 랜덤과
     폼(effective_ovr) 없이 계산한다. 실제 연봉은 새 규칙으로 맺는데 적정 연봉만 기존 곡선(_calc_salary)
     으로 비교하면 계약 체계가 바뀌었다는 이유만으로 판매추진(salary_burden)·연봉 압박(_salary_press)이
     과하게 걸린다(4단계 측정: EPL OVR95 26세 V=1 비율 2.81). my_contract_salary는 순수 계산(난수·쓰기
     없음)이고 _my_verification은 메모만 갱신하므로 그대로 재사용한다."""
+    # [2026-11-26] V: 호출부가 이미 구한 검증도(my_salary_market_and_cap — 오퍼 구단 기준 계산은 p의 소속팀을 바꿔
+    # 넣으므로 여기서 다시 구하면 안 된다). None이면 예전처럼 p로 계산.
     return my_contract_salary(wealth, tier, p.get("ovr", 60), country, team_name=team_name,
                               team_id=team_id, year=year, age=p.get("age"),
-                              V=_my_verification(p, year), eff_ovr=None, adj_mult=1.0)
+                              V=_my_verification(p, year) if V is None else V, eff_ovr=None, adj_mult=1.0)
 
 
 def _salary_press(p) -> float:
@@ -18061,7 +18074,13 @@ def _apply_ballon_top1_gate(c, year, top):
     if not top:
         return top
     info = _ballon_top1_gate_info(c, year, top)
-    new, paths = _B.apply_top1_gate(top, lambda e: _B.top1_paths(info.get(e["player_id"]) or {}))
+    # [2026-11-26 신민용 확정 — A-3] 필터 전 1위가 기존 자격이 없어도 5대 리그 우승팀 소속이거나 개인 점수가 Top10 안
+    # 다른 선수보다 1.0 이상 높으면 1위 그대로(ballon_award.top1_exception_paths). top은 상위 3명 경쟁까지 거친 순서.
+    new, paths = _B.apply_top1_gate(
+        top, lambda e: _B.top1_paths(info.get(e["player_id"]) or {}),
+        exception_of=lambda lst: _B.top1_exception_paths(lst, info.get(lst[0]["player_id"]) or {}))
+    if paths and paths[0].startswith("예외-"):
+        print(f"[AWARD] {year} 발롱도르 1위 자격 예외: {top[0]['player_id']}({'/'.join(paths)}) 1위 유지")
     # [2026-11-15 신설, 신민용 요청: "왜 점수가 낮은데 1위냐"] 화면 표시용 표식 — 1위의 자격 경로("top1:A/D"),
     # 점수로는 1위보다 앞섰지만 자격이 없어 밀린 선수("top1_miss"). 저장 칸은 xi_slot(발롱 행은 원래 비어 있음 —
     # xi_formation이 포메이션 이름이 아니라 화면의 베스트 11 배치에는 안 쓰인다). 점수·순서는 그대로.
@@ -22141,6 +22160,21 @@ def _end_of_season(p, year, progress_cb=None):
     # 작다).
     from database import history_drain
     history_drain()
+    # [2026-11-20 버그수정, 신민용 리포트: "16세에 1부 28골·리그 MVP인데 골든보이 후보에도 없다"] 개인상의 내 역할
+    # 게이트(_AWARD_EXCLUDED_ROLES — 대기·전력외·유망주)는 my_player_position_history의 그 해 행을 읽는데, 그 해 실제
+    # 출전으로 보정한 역할 스냅샷(snapshot_my_player_position)은 이 함수 뒤쪽(개인상 계산 다음)에서야 찍혔다. 그래서
+    # 개인상은 입단 순간 OVR로 정한 역할(16세 입단 = 유망주)을 그대로 읽어, 한 시즌 내내 주전으로 뛴 선수도 골든보이·
+    # 코파 트로피·발롱도르·세계 베스트 11 후보에서 빠졌다. 같은 스냅샷을 개인상 계산 직전에 한 번 더 찍는다(그 해
+    # 시즌 기록 my_player_season_stats는 위에서 이미 저장됨). 뒤쪽 원래 호출은 그대로 둔다(같은 계산을 다시 저장).
+    # 전역 난수는 건드리지 않게 상태를 되돌린다.
+    _rs_snap = random.getstate()
+    try:
+        from ai_lifecycle import snapshot_my_player_position as _snap_my_pos
+        _snap_my_pos(year)
+    except Exception as _e:
+        print(f"[내 포지션 아카이브 오류(개인상 전)] {year}년: {_e}")
+    finally:
+        random.setstate(_rs_snap)
     _compute_season_individual_awards(year, my_ctx=_my_ctx)
     # [2026-09 신설, 히스토리 비동기 writer] _process_awards(바로 아래)는
     # "이 결과를 조회만 함"(위 _compute_season_individual_awards docstring
@@ -28155,11 +28189,19 @@ def my_salary_market_and_cap(p=None, year=None, team_id=None):
         p = get_player()
     if not p:
         return (0, 0)
+    if year is None:
+        year = (get_state() or {}).get("current_year")
+    # [2026-11-26 버그수정, 신민용 리포트: "오퍼 연봉 협상이 다 '한도'로 잠겨 있다 — 같은 리그라도 21억·19억처럼 금액이
+    # 다른데도"] 검증도(V)는 선수 본인 실적이라 어느 구단과 협상하든 같아야 하는데, 아래에서 소속팀을 오퍼 구단으로 바꿔
+    # 넣은 p로 구하고 있었다 — _my_verification_parts는 "지금 소속팀에 진행 중인 계약(career_entries end_year=0)"이
+    # 있어야 이번 시즌 기록을 넣는데, 오퍼 구단에는 그런 계약이 없어 이번 시즌 몫이 0으로 빠졌다. 시즌 도중(진행률>0)
+    # 경기를 뛴 선수일수록 시장 연봉·상한이 낮게 나와, 실제 소속팀 기준 V로 만든 오퍼 연봉이 상한을 넘었다(재현: 24주·
+    # 진행률 0.5·V 0.257 → 바꿔 넣은 V 0 → 오퍼/시장 1.77, 다섯 구단 전부 잠김). 1주차(진행률 0)엔 차이가 없어 안 보였다.
+    # 오퍼 연봉(_calc_offer_salary)과 같은 값 — 바꾸기 전 p로 한 번 구해 쓴다. 재계약(team_id 없음)은 예전과 같다.
+    V = _my_verification(p, year)
     if team_id:
         p = dict(p)
         p["current_team_id"] = team_id
-    if year is None:
-        year = (get_state() or {}).get("current_year")
     gt = _my_grade_tier(p)
     if not gt:
         return (0, 0)
@@ -28170,7 +28212,7 @@ def my_salary_market_and_cap(p=None, year=None, team_id=None):
         row = c.execute("SELECT name FROM teams WHERE id=?", (tid,)).fetchone()
     finally:
         c.close()
-    market = int(_my_fair_salary(p, wealth, tier, country, row["name"] if row else None, tid, year) or 0)
+    market = int(_my_fair_salary(p, wealth, tier, country, row["name"] if row else None, tid, year, V=V) or 0)
     nat_cap = int(_clamp_salary_to_cap(10 ** 15, wealth, country, tier, ovr=p.get("ovr"), year=year))
     if market <= 0:
         return (0, nat_cap)
@@ -29803,10 +29845,10 @@ def join_team(team_id, salary, transfer_type: str = "입단", offer: dict = None
         _best_pos, _best_rank = _primary, 0
         _best_found = 999
         import sub_positions as _subp
-        _my_sub_j = _subp.my_sub()      # [2026-10 주포·부포] 내 부포 슬롯은 순위 SUB_POS_RANK(부포 = OVR −1)
+        _my_sub_j = _subp.my_entry()    # [2026-10 주포·부포] 내 부포 슬롯은 순위 SUB_POS_RANK(부포 = OVR −1) [2026-11-25] 2개면 튜플
         from constants import SUB_POS_RANK as _SPR_j
         for _slot in _slots:
-            if _my_sub_j and _slot == _my_sub_j:
+            if _my_sub_j and _subp.is_sub_slot(_my_sub_j, _slot):
                 _rank = _SPR_j
             elif _slot in _compat:
                 _rank = _compat.index(_slot)

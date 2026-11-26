@@ -183,6 +183,83 @@ class StandingsWindow(QDialog):
         self._fill_table()
         self._last_sig = self._compute_sig()
 
+    _CONT_TABLES = (("champions", "cl_tournaments", "cl_entries"),
+                    ("europa", "el_tournaments", "el_entries"),
+                    ("conference", "ecl_tournaments", "ecl_entries"))
+    _CONT_COLOR = {"champions": "#4466ff", "europa": "#ff7700", "conference": "#215131"}
+
+    def _cont_bucket(self, c):
+        """이 리그 나라의 대륙대회 대륙 이름(champions_engine.CONTINENT_MAP) — 없으면 None."""
+        crow = c.execute("SELECT continent FROM countries WHERE id=?", (self._country_id,)).fetchone()
+        if not crow or not crow["continent"]:
+            return None
+        from competition.champions_engine import CONTINENT_MAP
+        return CONTINENT_MAP.get(crow["continent"])
+
+    def season_half(self) -> str:
+        """[2026-11-26 신설, 신민용 확정] 순위표 표시 기준 — "first"(상반기) / "second"(하반기).
+        날짜가 아니라 대륙대회 상태로 가른다: 이 리그 대륙의 올해 클럽 대회(챔스·유로파·컨퍼런스) 중 하나라도
+        끝나지 않았으면 상반기, 전부 끝났으면 하반기. 올해 대회가 아직 안 만들어졌으면(추첨 주 CL_START_WEEK 전)
+        상반기, 이 대륙에 올해 대회가 아예 없으면(참가팀 부족 등) 추첨 주부터 하반기로 본다."""
+        st = get_state() or {}
+        year = st.get("current_year")
+        week = st.get("current_week") or 1
+        if not year or not self._country_id:
+            return "second"
+        conn = get_conn()
+        try:
+            c = conn.cursor()
+            cont = self._cont_bucket(c)
+            statuses = []
+            if cont:
+                for _k, ttbl, _e in self._CONT_TABLES:
+                    statuses += [r[0] for r in c.execute(
+                        f"SELECT status FROM {ttbl} WHERE year=? AND continent=?", (year, cont))]
+        finally:
+            conn.close()
+        if statuses:
+            return "first" if any(s != "done" for s in statuses) else "second"
+        from competition.champions_engine import CL_START_WEEK
+        return "first" if week < CL_START_WEEK else "second"
+
+    def _current_continental_colors(self) -> dict:
+        """[2026-11-26 신설] 상반기 — 올해 실제로 대륙대회에 나가는 팀 → 색. 대회가 만들어졌으면 참가 명단(entries)
+        그대로, 아직이면(추첨 주 전) 대회 생성과 같은 계산(직전 시즌 최종 순위 워터폴 — start_champions_league ·
+        continental_qualification이 쓰는 allocate_continental_slots(대륙, 직전 시즌, 올해))."""
+        colors: dict = {}
+        st = get_state() or {}
+        year, season = st.get("current_year"), st.get("current_season")
+        if not year or season is None:
+            return colors
+        conn = get_conn()
+        try:
+            c = conn.cursor()
+            cont = self._cont_bucket(c)
+            if not cont:
+                return colors
+            made = False
+            for comp, ttbl, etbl in self._CONT_TABLES:
+                for (tid,) in c.execute(
+                        f"""SELECT e.team_id FROM {etbl} e JOIN {ttbl} t ON t.id = e.tournament_id
+                            WHERE t.year=? AND t.continent=?""", (year, cont)):
+                    made = True
+                    colors.setdefault(tid, self._CONT_COLOR[comp])
+        finally:
+            conn.close()
+        if made or season - 1 < 0:
+            return colors
+        try:
+            from competition.continental_qualification import allocate_continental_slots
+            alloc = allocate_continental_slots(cont, season - 1, year)
+            for comp, color in self._CONT_COLOR.items():
+                if len(alloc.get(comp, [])) < 4:   # start_all_continental_competitions — 4팀 미만이면 대회를 안 만든다
+                    continue
+                for entry in alloc.get(comp, []):
+                    colors.setdefault(entry["team_id"], color)
+        except Exception:
+            pass
+        return colors
+
     def _compute_zone_colors(self, rows) -> dict:
         """[2026-08 v3.5 신설, 신민용 요청] 리그 순위표 각 팀의 글자색을
         승격/강등/대륙대항전 진출 구간에 맞춰 정한다 — 상자(배경) 색이
@@ -209,6 +286,11 @@ class StandingsWindow(QDialog):
         colors: dict = {}
         if not self._tier or not self._country_id:
             return colors
+        # [2026-11-26 신설, 신민용 확정] 상반기·하반기 표시 기준 분리 — season_half() 참고.
+        #   상반기: 올해 실제로 대륙대회(챔스·유로파·컨퍼런스)에 나가는 팀만(1부), 승격·강등·PO 표시 없음.
+        #   하반기: 아래 기존 표시 그대로(다음 시즌 진출 예상 순위 + 승격·강등·PO).
+        if self.season_half() == "first":
+            return self._current_continental_colors() if self._tier == 1 else colors
         # [2026-10 병역 시스템 6단계] 군데스리가: 클럽대항전 없음, 자동 승강 없음 —
         # 승강 표시만 뜬다. 2부 1~4위 = 승격 플레이오프권, 1부 6위(최하위) = 승강전권(옐로).
         try:

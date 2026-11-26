@@ -135,9 +135,24 @@ def _pref_for(pref, slots, pos):
 from constants import SUB_POS_RANK   # [2026-10] 부포 = OVR −1 (constants.SUB_POS_OVR_COST 주석 참고)
 
 
-def _sub_mult_pen(ovr):
+def _sub_mult_pen(ovr, main=None, slot=None):
     import sub_positions as _sp
-    return _sp.sub_mult_penalty(ovr, POSITION_MISMATCH_PENALTY[1])
+    return _sp.sub_mult_penalty(ovr, POSITION_MISMATCH_PENALTY[1], main, slot)   # [2026-11-25] main·slot은 B안에서만
+
+
+def _is_sub_slot(sub, slot):
+    """[2026-11-25 SUB_POS_V2] 부포 값(문자열 또는 (부포1, 부포2))에 slot이 있는가 — 문자열이면 예전 sub == slot."""
+    if sub.__class__ is tuple:
+        return slot in sub
+    return sub == slot
+
+
+def _dict_sub(pl):
+    """[2026-11-25 SUB_POS_V2] 선수 dict의 부포 값 — "sub_pos2"가 있으면 튜플, 아니면 "sub_pos"(예전 값 그대로)."""
+    s2 = pl.get("sub_pos2")
+    if s2:
+        return (pl.get("sub_pos"), s2)
+    return pl.get("sub_pos")
 
 # 부포(선수 dict의 "sub_pos", prep 묶음의 세 번째 값)가 있는 선수만 아래 경로를 탄다. 부포가 없으면
 # 모든 함수가 예전 값을 그대로 돌려준다 — 스위치 OFF·부포 0명이면 기존 경로 100%.
@@ -153,7 +168,7 @@ def _pref_sub(slots_key, slots, pos, sub):
         compat = POSITION_COMPAT.get(pos, [pos])
         tmp = []
         for i, sp in enumerate(slots):
-            if sp == sub:
+            if _is_sub_slot(sub, sp):           # [2026-11-25 SUB_POS_V2] 부포 2개면 둘 다
                 tmp.append((SUB_POS_RANK, i))   # [2026-10] 부포 = OVR −1 → 주포(0)와 2순위(1) 사이
             elif sp in compat:
                 tmp.append((compat.index(sp), i))
@@ -166,7 +181,7 @@ def _pref_sub(slots_key, slots, pos, sub):
 def slot_rank(pl, slot_pos):
     """선수 dict 기준 미스매치 순위 — 부포 슬롯이면 SUB_POS_RANK, 아니면 기존 _mismatch_rank(주포, 슬롯)."""
     sub = pl.get("sub_pos")
-    if sub and sub == slot_pos:
+    if (sub and sub == slot_pos) or (pl.get("sub_pos2") and pl.get("sub_pos2") == slot_pos):
         return SUB_POS_RANK
     return _mismatch_rank(pl.get("position") or "CM", slot_pos)
 
@@ -331,7 +346,7 @@ def _greedy_fill_slots(candidates, slots_only):
     still_left = []
     for pl in remaining:
         got = -1
-        _sub = pl.get("sub_pos")
+        _sub = _dict_sub(pl)       # [2026-11-25 SUB_POS_V2] 부포 2개면 튜플
         for i in (_pref_sub(_slots_key, slots_only, pl.get("position", "CM"), _sub) if _sub
                   else _pref_for(pref, slots_only, pl.get("position", "CM"))):
             if slot_filled[i] is None:
@@ -893,18 +908,38 @@ def _slot_value(pl, slot_pos):
     경로 중 높은 값) — constants 주석 참고. 끄면 예전과 100% 같다."""
     pos = pl.get("position") or "CM"
     _sub = pl.get("sub_pos")
+    _sub2 = pl.get("sub_pos2")
     _ovr = pl.get("ovr") or 0
     _foot = foot_fit_mult(slot_pos, pl.get("foot") or "", pl.get("sub_role") or "")
+    if _sub2:
+        # [2026-11-25 SUB_POS_V2] 부포 2개 — 부포마다 따로 계산해 가장 높은 값. 부포 자리 자체면 그 부포 값(부포 1개와 같은 규칙),
+        # 아니면 주포 경로와 각 부포 경로(부포 OVR − 감점에서 그 자리까지의 거리 감점) 중 최대.
+        _subs = (_sub, _sub2) if _sub else (_sub2,)
+        if _TIER_ON[0]:
+            for _s in _subs:
+                if _s == slot_pos:
+                    return _ovr * (1.0 - _sub_mult_pen(_ovr, pos, _s)) * _foot
+            v = _ovr * (1.0 - _tier_penalty(pos, slot_pos))
+            if slot_pos != "GK":
+                import sub_positions as _sp_v
+                for _s in _subs:
+                    if _s != "GK":
+                        v = max(v, (_ovr - _sp_v.sub_cost(pos, _s)) * (1.0 - _tier_penalty(_s, slot_pos)))
+            return v * _foot
+        for _s in _subs:
+            if _s == slot_pos:
+                return _ovr * (1.0 - _sub_mult_pen(_ovr, pos, _s)) * _foot
+        return _ovr * (1.0 - _mismatch_penalty(pos, slot_pos)) * _foot
     if _TIER_ON[0]:
         if _sub and _sub == slot_pos:
-            return _ovr * (1.0 - _sub_mult_pen(_ovr)) * _foot
+            return _ovr * (1.0 - _sub_mult_pen(_ovr, pos, _sub)) * _foot
         v = _ovr * (1.0 - _tier_penalty(pos, slot_pos))
         if _sub and _sub != "GK" and slot_pos != "GK":
-            from constants import SUB_POS_OVR_COST
-            v = max(v, (_ovr - SUB_POS_OVR_COST) * (1.0 - _tier_penalty(_sub, slot_pos)))
+            import sub_positions as _sp_v
+            v = max(v, (_ovr - _sp_v.sub_cost(pos, _sub)) * (1.0 - _tier_penalty(_sub, slot_pos)))
         return v * _foot
     return (_ovr
-            * (1.0 - (_sub_mult_pen(_ovr) if (_sub and _sub == slot_pos)
+            * (1.0 - (_sub_mult_pen(_ovr, pos, _sub) if (_sub and _sub == slot_pos)
                       else _mismatch_penalty(pos, slot_pos)))
             * _foot)
 
@@ -929,7 +964,7 @@ _SLOT_VALUE_SIG = [None]
 def slot_value_key(pl):
     """_slot_value(pl, 슬롯)가 선수 dict에서 읽는 값 전부. 이 키가 같은 두 선수는 어느 슬롯에서든 값이 같다."""
     k = (pl.get("position") or "CM", pl.get("sub_pos"), pl.get("ovr") or 0,
-         pl.get("foot") or "", pl.get("sub_role") or "")
+         pl.get("foot") or "", pl.get("sub_role") or "", pl.get("sub_pos2"))   # [2026-11-25] 두 번째 부포
     return _SLOT_KEY_INTERN.setdefault(k, k)
 
 
@@ -937,7 +972,8 @@ def slot_value_memo():
     """(선수 키, 슬롯) → 값 dict. 설정이 지난번과 다르면 비워서 돌려준다(True = 방금 비웠다)."""
     import constants as _C
     sig = (_TIER_ON[0], _FOOT_PEN[0], _C.SUB_POS_OVR_COST, POSITION_MISMATCH_PENALTY[1],
-           getattr(_C, "POSITION_TIER_PCT", None))
+           getattr(_C, "POSITION_TIER_PCT", None),
+           getattr(_C, "SUB_POS_V2", False), getattr(_C, "SUB_POS_COST_MODE", "A"))   # [2026-11-25 SUB_POS_V2]
     if sig != _SLOT_VALUE_SIG[0]:
         _SLOT_VALUE_MEMO.clear()
         _SLOT_KEY_INTERN.clear()
@@ -948,8 +984,8 @@ def slot_value_memo():
 
 def slot_value_by_key(k, slot_pos):
     """선수 키로 _slot_value를 그대로 계산한다(재사용 값이 없을 때만 불린다)."""
-    return _slot_value({"position": k[0], "sub_pos": k[1], "ovr": k[2], "foot": k[3], "sub_role": k[4]},
-                       slot_pos)
+    return _slot_value({"position": k[0], "sub_pos": k[1], "ovr": k[2], "foot": k[3], "sub_role": k[4],
+                        "sub_pos2": k[5]}, slot_pos)
 
 
 def refresh_tier_switch():
@@ -1123,7 +1159,7 @@ def prep_roster(roster):
     것과 같으므로 배정 순서도 동일하다."""
     ordered = sorted(roster, key=lambda x: -(x.get("ovr", 0) or 0))
     # [2026-10 주포·부포] 세 번째 값 = 부포(없으면 None). 앞 두 값과 정렬은 예전 그대로다.
-    return [(p.get("position", "CM"), (p.get("ovr", 0) or 0), p.get("sub_pos")) for p in ordered]
+    return [(p.get("position", "CM"), (p.get("ovr", 0) or 0), _dict_sub(p)) for p in ordered]   # [2026-11-25] 2개면 튜플
 
 
 def formation_fit_penalty_prepped(prepped, slots_key, slots):
@@ -1186,7 +1222,7 @@ def formation_fit_penalty_prepped(prepped, slots_key, slots):
         # (OVR × (1 − 미스매치), 주발 없음)로 따로 돈다 — 실제 경기 배치(_slot_value)와 독립.
         def _pen(pl, slot_pos):
             _s = pl[2] if len(pl) > 2 else None
-            return _sub_mult_pen(pl[1]) if (_s and _s == slot_pos) else _mp(pl[0], slot_pos)
+            return _sub_mult_pen(pl[1], pl[0], slot_pos) if (_s and _is_sub_slot(_s, slot_pos)) else _mp(pl[0], slot_pos)
         _value_swap_pass(filled, slots, lambda pl, s: pl[1] * (1.0 - _pen(pl, s)), lambda pl: pl[0],
                          lambda pl: len(pl) > 2 and bool(pl[2]), cap_fn=lambda pl: pl[1])
     else:

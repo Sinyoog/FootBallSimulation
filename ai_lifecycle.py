@@ -24,6 +24,8 @@ import contextlib   # [2026-08 최적화] _indexes_off_for_mass_update용
 import economy as _economy   # [2026-09 최적화] 이적료 산정 배치 캐시 begin/end용
 import club_ledger as _CL   # [2026-11-21 클럽 선수단 운영 개편 — 검증용, club_ledger.py 참고]
 import virtual_youth as _VY   # [2026-11-22 1단계 — 가상 유스·공급원 공통 판정(이 모듈 한 곳)]
+import youth_reform as _YR   # [2026-11-25 유스 개편 — constants.VY_REFORM(꺼져 있으면 아무것도 안 함)]
+import youth_supply as _YS   # [2026-11-26 VY_STANDALONE] 신인 대신 유스 데뷔(기본 게임 유스팀)
 from database import _squad_ovr_hard_min, _lift_stats_to_ovr
 # [2026-10 병역 시스템 2단계] 군팀·복무 중인 선수는 이적/임대/재계약/스카우팅/
 # 보충 생성/외국인 쿼터 조정/은퇴 대상에서 전부 빠진다(팀이 바뀌는 건 진급·강등뿐).
@@ -46,6 +48,7 @@ from formation_logic import (_SLOT_TARGET_MAP,
 # [2026-10 주포·부포] 부포 공용 모듈(sub_positions.py) — 스위치 OFF·부포 0명이면 전부 무동작.
 from sub_positions import (attach as _subp_attach, my_sub as _subp_my_sub,
                            active as _subp_active, acquire as _subp_acquire)
+from sub_positions import set_my_sub2 as _set_my_sub2   # [2026-11-25 SUB_POS_V2]
 
 try:
     import numpy as np
@@ -1060,6 +1063,12 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None, 
     # [2026-10] STAR_NAT_IGNORE_QUOTA — 은퇴대체부터 아래 정원 보정까지만 켠다(정의부 주석 참고).
     _STAR_NAT_CTX.update(on=STAR_NAT_IGNORE_QUOTA, protect={}, overquota=0, protected_hits=0)
     _foreign_floor_begin()   # [2026-10] SEASON_FOREIGN_ADULT — 은퇴대체~스쿼드 보정 구간
+    if _VY.standalone():
+        # [2026-11-26 VY_STANDALONE] 유스팀 보유 자격 재평가(새 자격 → 생성, 상실 → 유예/폐쇄 예약) — 은퇴 대체가
+        # 이번 오프시즌 첫 신인 공급이므로 그 전에 풀을 맞춘다.
+        _t_sa = _time_perf.perf_counter()
+        _sa_res = _VY.sa_reeval(c, year)
+        _perf_log(f"[VY-SA] {year} 유스팀 재평가 {_sa_res} {_time_perf.perf_counter() - _t_sa:.1f}s")
     retired    = _retire_and_replace(c, year, _VY.drop_rows(c, shared_ai_rows, "team_id"))   # [2026-11-22 1단계] 가상 유스 제외(virtual_youth)
     # [2026-09 이동, 신민용 확정: "임대처가 다시 이적 보내는 건 없어야 하지만
     # 여러 번 임대 다니는 선수는 있잖아"] 여러 번 임대는 현실에서 "임대가
@@ -1073,6 +1082,16 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None, 
     # 끝낸다 — 그래야 이적시장이 복귀한 선수를 원 소속팀 선수로 본다.
     loan_returned = _process_loan_returns(c, year)
     _gk3_excess_move(c, year, "임대 복귀")   # [2026-11-06] 임대 복귀 마지막 단계(연장·완전 이적 불가)로 4명이 된 팀 즉시 정리
+    if _YR.on():
+        # [2026-11-25 유스 개편] 은퇴·임대 복귀 뒤, 여름 시장 전: 전용 정원 편입(은퇴 빈자리) → 육성 승격 → 외부 데뷔
+        _t_yr = _time_perf.perf_counter()
+        try:
+            _yr_res = _YR.pre_market(c, year)
+            _perf_log(f"[VY-REFORM] {year} 시장 전 {_yr_res} {_time_perf.perf_counter() - _t_yr:.1f}s")
+        except Exception as _e_yr:
+            import traceback as _tb_yr
+            _CL.LOG["yr|error_pre_market"] += 1
+            print(f"[VY-REFORM] 시장 전 처리 실패(계속 진행): {_e_yr}\n{_tb_yr.format_exc()}")
     # [2026-10 주포·부포] 부포 획득(2시즌 연속 같은 비주포 슬롯 선발) — 이적시장·보충 목표표·다음 시즌
     # 역할 계산이 새 부포를 보도록 여기서. 스위치 OFF면 아무것도 읽거나 쓰지 않는다. 난수 미사용.
     try:
@@ -1162,13 +1181,26 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None, 
         # [2026-10 유스 시스템] 산하팀 연령 초과 정리 → 최소 인원까지 신인 충원(스쿼드 규모 정리 앞)
         _YOUTH_CTX["aff"] = None
         _affiliate_intake(c, year, _affiliate_age_cleanup(c, year))
-    if _VY.stage1():
-        _VY.cleanup(c, year)   # [2026-11-22 1단계] 24세 이상 미승격 가상 유스 정리(실제 유스 나이 정리와 같은 단계)
+    if _VY.v3():
+        import youth_market as _YM
+        _YM.run(c, year)   # [2026-11-26 S5] 유스 진로 시장(VY_V3_MARKET) — 24세 정리·인원 보충 앞
+    if _VY.active():
+        _VY.cleanup(c, year)   # [2026-11-22 1단계] 24세 이상 미승격 가상 유스 정리(실제 유스 나이 정리와 같은 단계) [2026-11-26] 단독 모드도
     if _sq2_on():
         _sq2_reset_log()
     if _CL.full():
         _ledger_supply_pass(c, year)   # [2026-11-21] 시장 뒤 보충 패스(이적 → 유스 승격 → 신인)
     _gk3_excess_move(c, year, "보충 전")   # [2026-11-02 GK 3명 설계안 2] GK 4명 이상 팀의 초과 GK → GK 부족 팀
+    if _YR.on():
+        # [2026-11-25 유스 개편] 유예가 끝났는데 정원 밖인 육성 승격 선수 정리(이적 → 임대 → 자유 이적)
+        try:
+            _yr_exp = _YR.expire(c, year)
+            if _yr_exp:
+                _perf_log(f"[VY-REFORM] {year} 유예 끝 정리 {_yr_exp}")
+        except Exception as _e_yr2:
+            import traceback as _tb_yr2
+            _CL.LOG["yr|error_expire"] += 1
+            print(f"[VY-REFORM] 유예 끝 정리 실패(계속 진행): {_e_yr2}\n{_tb_yr2.format_exc()}")
     topped_up, forced_out = _rebalance_squad_sizes(c, year)
     _ta3b = _time_perf.perf_counter()
     # [2026-09 신설, 신민용 요청: "선수의 한계치를 국가별로 최대 2명으로
@@ -1223,6 +1255,13 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None, 
     if _VY.stage1():
         _youth_exact26(c, year)   # [2026-11-22 1단계] 실제 유스팀 정확히 26명(GK 3 + 필드 23)
         _VY.intake(c, year)       # [2026-11-22 1단계] 가상 유스 정기 입단(K명까지, 다음 창구부터 승격 후보)
+    elif _VY.standalone():
+        # [2026-11-26 VY_STANDALONE] 유예가 끝난 유스팀 폐쇄(남은 선수 정리) → 유예·폐쇄 아닌 유스팀 VY_SA_POOL명까지 입단
+        _t_sa = _time_perf.perf_counter()
+        _sa_cl = _VY.sa_close(c, year)
+        _sa_in = _VY.sa_intake(c, year)
+        _perf_log(f"[VY-SA] {year} 폐쇄 {_sa_cl} 입단 {_sa_in} 신인 대신 유스 {dict(_YS.STATS)} "
+                  f"{_time_perf.perf_counter() - _t_sa:.1f}s")
     # [2026-11-06 신민용 확정] 모든 이동·보충이 끝난 이 시점에 GK 3명 미만 팀을 남긴다 — 다음 오프시즌 연속 판정용
     _GK_SHORT_LAST.clear()
     _GK_SHORT_LAST.update(_gk_short_record(c, year))
@@ -1521,6 +1560,58 @@ def _ensure_ai_sub_roles(c):
 _YOUTH_PCAP_CTX: dict = {}   # [2026-10 유스 시스템] {산하팀: 모구단 성장 상한} — _age_and_progress가 채운다
 
 
+
+
+# [2026-11-26 VY_GEN_V3] _age_and_progress가 읽는 열(순서 고정 — _age_and_progress_np가 위치로 읽는다). 유스 V3 월드 생성
+# 성장 적용도 같은 열을 WHERE id IN (...)로 읽는다.
+_AGE_PROGRESS_SQL = ("SELECT id, position, age, team_id, " + _STAT_COLS +
+                     ", ovr, peak_ovr, ovr_user_locked, potential_ovr, true_nationality, "
+                     "COALESCE(military_status, '') FROM ai_players")
+
+def _growth_team_caps(c):
+    """[2026-11-26 VY_GEN_V3] _age_and_progress의 팀별 성장 상한(team_cap) 조회를 그대로 떼어 낸 함수 — 유스 V3의
+    월드 생성 성장 적용(virtual_youth._v3_project)도 같은 상한을 쓰도록. 동작·순서는 원래 코드와 같다
+    (_YOUTH_PCAP_CTX도 여기서 채운다). 반환 {team_id: 상한}."""
+    from constants import CONTINENT_OVR_BONUS, COUNTRY_OVR_ADJ, get_country_league_grade, get_ovr_range
+    team_cap: dict = {}
+    for r in c.execute(
+            """SELECT t.id AS tid, t.current_tier AS tier, cn.name AS cname,
+                      cn.continent AS continent
+               FROM teams t JOIN leagues l ON t.league_id = l.id
+               JOIN countries cn ON l.country_id = cn.id""" + _VY.team_cap_union_sql(c)).fetchall():
+        # [2026-11-22 1단계] 가상 유스 팀도 같은 공식 — 부수 = 가상 리그 수준(모구단 한 부 아래), 나라 = 모구단 나라
+        grade = get_country_league_grade(r["cname"])
+        # [2026-08] tier1은 COUNTRY_LEAGUE_OVR_OVERRIDE 등록국이면 그 값을 우선.
+        rng = get_ovr_range(grade, r["tier"] or 1, r["cname"])
+        top = rng[1] if rng else 43
+        # [버그수정 2026-07, 신민용 리포트: "이적시장 처리 중 오류: 'float'
+        # object cannot be interpreted as an integer"] COUNTRY_OVR_ADJ에
+        # 대한민국(1.5)·세르비아(-1.5)·우루과이/콜롬비아/에콰도르(-0.5)처럼
+        # 소수점 조정치가 섞여 있어서, 이 값이 그대로 bonus에 더해지면
+        # bonus 자체가 float이 되고, 그게 OVR 상한 계산에 계속 실려
+        # 내려가다가 결국 아래(신인 교체 로직)의 random.randint(mid, hi)에
+        # float가 그대로 들어가 터졌다. 정수 등급 보정치라는 원래 의도대로
+        # 여기서 반올림해 int로 확정한다.
+        bonus = round(CONTINENT_OVR_BONUS.get(r["continent"], 0) + COUNTRY_OVR_ADJ.get(r["cname"], 0))
+        if grade == "SS":
+            bonus = min(bonus, 0)
+        team_cap[r["tid"]] = min(99, top + bonus + 3)
+    # [2026-10 병역 시스템] 군팀은 "환경 상한"이 없다 — 복무 중에도 평소처럼
+    # 개인 잠재력(potential_ovr)까지만 성장/노화한다(신민용 확정: 군대라서
+    # 오르거나 깎이는 개념 없음). 군대가 없으면 빈 집합이라 아무 변화 없음.
+    from military_service import get_military_team_ids as _get_mil_tids_cap
+    for _mt in _get_mil_tids_cap(c):
+        team_cap[_mt] = 99
+    # [2026-10 유스 시스템, constants.YOUTH_PARENT_CAP] 산하팀의 23세 이하(다음 시즌 나이) 선수는 모구단 상한.
+    import constants as _Cy
+    _YOUTH_PCAP_CTX.clear()
+    if _Cy.YOUTH_PARENT_CAP:
+        from database import affiliate_parent_map
+        for _ch, _pa in list(affiliate_parent_map(c).items()) + list(_VY.parent_map(c).items()):
+            if _pa in team_cap and _ch in team_cap and team_cap[_pa] > team_cap[_ch]:
+                _YOUTH_PCAP_CTX[_ch] = team_cap[_pa]   # [2026-11-22] 가상 유스도 실제 산하팀과 같은 모구단 상한
+    return team_cap
+
 def _age_and_progress(c):
     """모든 AI 선수 나이 +1 후, 연령대별로 스탯 성장/노화 → ovr 재계산.
     [2026-07 개선] numpy가 있으면 전체를 벡터 연산으로 처리(_age_and_progress_np),
@@ -1561,43 +1652,7 @@ def _age_and_progress(c):
     # ── team_id → 성장기 스탯 상한 사전 조회 (선수마다 매번 JOIN 방지) ──
     # 등급별 OVR_RANGES 상단에 대륙보정 + 나라별 미세조정까지 반영해서,
     # 초기 생성 때 쓰는 보정치와 항상 같은 기준으로 성장 상한을 잡는다.
-    team_cap: dict = {}
-    for r in c.execute(
-            """SELECT t.id AS tid, t.current_tier AS tier, cn.name AS cname,
-                      cn.continent AS continent
-               FROM teams t JOIN leagues l ON t.league_id = l.id
-               JOIN countries cn ON l.country_id = cn.id""" + _VY.team_cap_union_sql(c)).fetchall():
-        # [2026-11-22 1단계] 가상 유스 팀도 같은 공식 — 부수 = 가상 리그 수준(모구단 한 부 아래), 나라 = 모구단 나라
-        grade = get_country_league_grade(r["cname"])
-        # [2026-08] tier1은 COUNTRY_LEAGUE_OVR_OVERRIDE 등록국이면 그 값을 우선.
-        rng = get_ovr_range(grade, r["tier"] or 1, r["cname"])
-        top = rng[1] if rng else 43
-        # [버그수정 2026-07, 신민용 리포트: "이적시장 처리 중 오류: 'float'
-        # object cannot be interpreted as an integer"] COUNTRY_OVR_ADJ에
-        # 대한민국(1.5)·세르비아(-1.5)·우루과이/콜롬비아/에콰도르(-0.5)처럼
-        # 소수점 조정치가 섞여 있어서, 이 값이 그대로 bonus에 더해지면
-        # bonus 자체가 float이 되고, 그게 OVR 상한 계산에 계속 실려
-        # 내려가다가 결국 아래(신인 교체 로직)의 random.randint(mid, hi)에
-        # float가 그대로 들어가 터졌다. 정수 등급 보정치라는 원래 의도대로
-        # 여기서 반올림해 int로 확정한다.
-        bonus = round(CONTINENT_OVR_BONUS.get(r["continent"], 0) + COUNTRY_OVR_ADJ.get(r["cname"], 0))
-        if grade == "SS":
-            bonus = min(bonus, 0)
-        team_cap[r["tid"]] = min(99, top + bonus + 3)
-    # [2026-10 병역 시스템] 군팀은 "환경 상한"이 없다 — 복무 중에도 평소처럼
-    # 개인 잠재력(potential_ovr)까지만 성장/노화한다(신민용 확정: 군대라서
-    # 오르거나 깎이는 개념 없음). 군대가 없으면 빈 집합이라 아무 변화 없음.
-    from military_service import get_military_team_ids as _get_mil_tids_cap
-    for _mt in _get_mil_tids_cap(c):
-        team_cap[_mt] = 99
-    # [2026-10 유스 시스템, constants.YOUTH_PARENT_CAP] 산하팀의 23세 이하(다음 시즌 나이) 선수는 모구단 상한.
-    import constants as _Cy
-    _YOUTH_PCAP_CTX.clear()
-    if _Cy.YOUTH_PARENT_CAP:
-        from database import affiliate_parent_map
-        for _ch, _pa in list(affiliate_parent_map(c).items()) + list(_VY.parent_map(c).items()):
-            if _pa in team_cap and _ch in team_cap and team_cap[_pa] > team_cap[_ch]:
-                _YOUTH_PCAP_CTX[_ch] = team_cap[_pa]   # [2026-11-22] 가상 유스도 실제 산하팀과 같은 모구단 상한
+    team_cap = _growth_team_caps(c)
     _ap_t1 = _time_ap.perf_counter()
 
     # JOIN에 안 잡힌 팀(league_id/country_id 연결 누락 등)의 폴백 상한.
@@ -1619,10 +1674,7 @@ def _age_and_progress(c):
     # [2026-09 신설] potential_ovr 추가 — 개인별 "전성기 도달 가능 상한"
     # (database.roll_potential_ovr 정의부 주석 참고). 끝에 붙여서 기존
     # r[19]/r[20]/r[21](ovr/peak_ovr/ovr_user_locked) 인덱스는 그대로 둔다.
-    rows = rows.execute(
-        "SELECT id, position, age, team_id, " + _STAT_COLS +
-        ", ovr, peak_ovr, ovr_user_locked, potential_ovr, true_nationality, "
-        "COALESCE(military_status, '') FROM ai_players").fetchall()   # [2026-10] r[23]=국적(NAT_OVR_CEILING), [2026-11] r[24]=병역 상태
+    rows = rows.execute(_AGE_PROGRESS_SQL).fetchall()   # [2026-10] r[23]=국적(NAT_OVR_CEILING), [2026-11] r[24]=병역 상태
     _ap_t2 = _time_ap.perf_counter()
     if not rows:
         return 0, 0
@@ -4638,7 +4690,8 @@ def _retire_and_replace(c, year, ai_rows=None):
             if _gk_free:
                 _CL.LOG["retire_gk_ledger"] += 1
             if r["position"] != "GK" or _gk_free:
-                _rpos = _CL.cell_to_pos(_lg_rr.pick_cell(r["team_id"], random, _CyY.SQUAD_TARGET_EXCEPTION_PROB),
+                _rpos = _CL.cell_to_pos(_lg_rr.pick_cell(r["team_id"], random, _CyY.SQUAD_TARGET_EXCEPTION_PROB,
+                                                         retiree_pos=r["position"]),   # [2026-11-25 은퇴 대체 D안]
                                         random)
                 _CL.LOG["retire_pos_same" if _rpos == r["position"] else "retire_pos_changed"] += 1
 
@@ -5146,6 +5199,9 @@ def _retire_and_replace(c, year, ai_rows=None):
     _rt6 = _time_rt.perf_counter()   # ai_players 은퇴자 DELETE
     _rb_db0 = (c.execute("SELECT COUNT(*) FROM ai_players WHERE creation_source='retire_repl' AND created_year=?",
                          (year,)).fetchone()[0] if _lg_rr is not None else 0)
+    if new_rows and _YS.on():
+        # [2026-11-26 VY_STANDALONE] 신인 대신 유스 데뷔(같은 포지션·같은 수준 유스가 있으면 그 행은 새로 만들지 않는다)
+        new_rows = _YS.substitute(c, year, new_rows, 26, "retire_repl")
     if new_rows:
         # [2026-09 신설, 위 은퇴대체 국적 재배정 주석 참고] new_nat를
         # nationality/true_nationality 둘 다에 넣는다 — 은퇴대체로 새로
@@ -6813,7 +6869,9 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
     def _lg_promote(S, X, dep):
         """[2026-11-22 1단계] 판매 거래 안 공급원 승격 — 대체 R이 없을 때(여름·겨울 모두, GK 제외). 장부·DB 반영 뒤
         시장 메모리 표(명단·포지션 인원·외국인 수·크기 가중치)도 같이 고친다(_lg_newbie_inner와 같은 갱신)."""
-        sp = _ledger_source_promote(c, _LGM, S, X, dep["cell"], dep["ref"] - _CL.M_REPL, year, mid=is_mid_season)
+        sp = _ledger_source_promote(c, _LGM, S, X, dep["cell"], dep["ref"] - _CL.M_REPL, year, mid=is_mid_season,
+                                    main_only=bool(dep.get("main")),
+                                    cov_d0=(dep["d0"] if dep.get("need_cov") else None))
         if sp is None:
             return None
         p, src_t, _kind = sp
@@ -6872,13 +6930,16 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
             _CL.LOG["sale_free"] += 1
             return moves
         if not dep["gk"]:
-            R = LG.find_R(src, X, dep["cell"], dep["ref"], dep["d0"])
+            R = LG.find_R(src, X, dep["cell"], dep["ref"], dep["d0"], main_only=bool(dep.get("main")),
+                                    cov_d0=(dep["d0"] if dep.get("need_cov") else None))
             if R is not None:
                 rs = LG.pinfo[R][0]
                 LG.move(X, src, dst)
                 LG.move(R, rs, src)
                 _lg_check(src, dep["d0"])
                 _CL.LOG["sale_R"] += 1
+                if dep.get("main"):
+                    _CL.LOG["mainblk|sale_R"] += 1   # [2026-11-25 장부 R1] 주포 부족 때문에 연 게이트
                 _CL.LOG["sale_R_gap_sum"] += LG.pinfo[R][3] - dep["ref"]
                 if LG._stage1 and LG.is_foreign(R, src):
                     _ms = LG.meta[src]
@@ -6891,13 +6952,18 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
                     LG.move(X, src, dst)
                     _lg_check(src, dep["d0"])
                     _CL.LOG["sale_source"] += 1
+                    if dep.get("main"):
+                        _CL.LOG["mainblk|sale_source"] += 1
                     _CL.LOG[f"sale_source|{_sp[2]}|L{dep['lvl']}|{dep['cell']}"] += 1
                     return moves
-            if (not is_mid_season) and dep["lvl"] == 3:
+            if (not is_mid_season) and _CL.newbie_lvl_ok(dep):
                 if _lg_newbie(src, X, dep) is not None:
                     LG.move(X, src, dst)
                     _lg_check(src, dep["d0"])
                     _CL.LOG["sale_newbie"] += 1
+                    if dep.get("main"):
+                        _CL.LOG["mainblk|sale_newbie"] += 1
+                        _CL.LOG[f"mainblk|sale_newbie_L{dep['lvl']}|{dep['cell']}"] += 1
                     return moves
         if not redrawn:
             fr = set(LG.books[src].free_ids())
@@ -6910,6 +6976,8 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
                         _CL.LOG["redraw_ok"] += 1
                     return out
         _CL.LOG["sale_cancel_gk" if dep["gk"] else "sale_cancel"] += 1
+        if dep.get("main"):
+            _CL.LOG["mainblk|sale_cancel"] += 1   # [2026-11-25 장부 R1] 주포 부족으로 대체를 못 구해 취소
         _CL.LOG[f"sale_cancel_lvl{dep['lvl']}|{dep['cell']}"] += 1
         return None
 
@@ -7000,7 +7068,7 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
             "tB": [_mb["cname"], _mb["tier"], _mb["lid"], _mb["youth"]],
             "tH": ([_mh["cname"], _mh["tier"], _mh["lid"], _mh["youth"]] if _mh else None),
             "supplyB": LG.chain_supply[B], "preempt_youth": _pre_y is not None,
-            "preempt_newbie_try": (not is_mid_season) and dep["lvl"] == 3,
+            "preempt_newbie_try": (not is_mid_season) and _CL.newbie_lvl_ok(dep),
             "nat_P": LG.pinfo[P][4], "nat_R2": LG.pinfo[R2][4],
             "age_P": LG.pinfo[P][7], "loanP": LG.pinfo[P][6],
         })
@@ -7036,13 +7104,16 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
             _CL.LOG["sale_free"] += 1
             return moves
         if not dep["gk"]:
-            R = LG.find_R(src, X, dep["cell"], dep["ref"], dep["d0"])
+            R = LG.find_R(src, X, dep["cell"], dep["ref"], dep["d0"], main_only=bool(dep.get("main")),
+                                    cov_d0=(dep["d0"] if dep.get("need_cov") else None))
             if R is not None:
                 rs = LG.pinfo[R][0]
                 LG.move(X, src, dst)
                 LG.move(R, rs, src)
                 _lg_check(src, dep["d0"])
                 _CL.LOG["sale_R"] += 1
+                if dep.get("main"):
+                    _CL.LOG["mainblk|sale_R"] += 1   # [2026-11-25 장부 R1] 주포 부족 때문에 연 게이트
                 _CL.LOG["sale_R_gap_sum"] += LG.pinfo[R][3] - dep["ref"]
                 if LG._stage1 and LG.is_foreign(R, src):
                     _ms = LG.meta[src]
@@ -7081,6 +7152,8 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
                 LG.move(X, src, dst)
                 _lg_check(src, dep["d0"])
                 _CL.LOG["sale_source"] += 1
+                if dep.get("main"):
+                    _CL.LOG["mainblk|sale_source"] += 1
                 _CL.LOG[f"sale_source|{_sp[2]}|L{dep['lvl']}|{dep['cell']}"] += 1
                 return moves
 
@@ -7094,15 +7167,20 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
                 LG.move(X, src, dst)
                 _lg_check(src, dep["d0"])
                 _CL.LOG["sale_newbie"] += 1
+                if dep.get("main"):
+                    _CL.LOG["mainblk|sale_newbie"] += 1
+                    _CL.LOG[f"mainblk|sale_newbie_L{dep['lvl']}|{dep['cell']}"] += 1
                 return moves
 
-            how, out = _chain_resolve_rest(hold, _do_youth, _do_newbie, (not is_mid_season) and dep["lvl"] == 3,
+            how, out = _chain_resolve_rest(hold, _do_youth, _do_newbie, (not is_mid_season) and _CL.newbie_lvl_ok(dep),
                                            lambda pl: _lg_chain_commit(src, dst, X, dep, moves, pl))
             if hold is not None:
                 _CL.LOG[f"chain_hold_d|{how or 'cancel'}"] += 1
             if out:
                 return out
         _CL.LOG["sale_cancel_gk" if dep["gk"] else "sale_cancel"] += 1
+        if dep.get("main"):
+            _CL.LOG["mainblk|sale_cancel"] += 1   # [2026-11-25 장부 R1] 주포 부족으로 대체를 못 구해 취소
         _CL.LOG[f"sale_cancel_lvl{dep['lvl']}|{dep['cell']}"] += 1
         return None
 
@@ -9102,7 +9180,7 @@ def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, pr
         if side_off_by_tid is not None:
             import constants as _csd
             _sto = _side_tol()
-            _so = side_off_by_tid.get(src)
+            _so = side_off_by_tid.get(src) if not _CL.r1() else None   # [2026-11-25 장부 R1] 판매는 주포 기준
             for _sp_name, (_si_a, _si_b, _oi_a, _oi_b) in _SIDE_SLOT.items():
                 _ca = _scnt[_si_a] + (_so[_oi_a] if _so else 0)
                 _cb = _scnt[_si_b] + (_so[_oi_b] if _so else 0)
@@ -9925,7 +10003,7 @@ def _side_assign_roster(roster, formation):
     import sub_positions as _sp
     from squad_targets import held_assign, position_targets, _formation
     on = _sp.active()
-    ent = [(p, (_sp.get(pid) if on else None)) for pid, p, _o in roster]
+    ent = [(p, (_sp.entry(pid) if on else None)) for pid, p, _o in roster]
     _cnt, asg = held_assign(ent, position_targets(_formation(formation), len(roster)), return_assignment=True)
     return {roster[i][0]: asg[i] for i in range(len(roster))}
 
@@ -9973,7 +10051,7 @@ def _side_market_offsets(c, team_players):
     from squad_targets import held_assign, held_counter, position_targets, _formation
     _fm = dict(c.execute("SELECT id, formation FROM teams").fetchall())
     for tid, plist in team_players.items():
-        ent = [(p["position"], _sp.get(p["id"])) for p in plist]
+        ent = [(p["position"], _sp.entry(p["id"])) for p in plist]
         if not any(s for _p, s in ent):
             continue
         h = held_assign(ent, position_targets(_formation(_fm.get(tid)), len(plist)))
@@ -9987,7 +10065,7 @@ def _side_market_offsets(c, team_players):
 def _gen_topup_rows(c, tid, tier, cname, continent, tname, grade, need,
                      roster_by_team, name_cache, year, is_override,
                      foreign_ct0=0, src_tag="squad_topup",
-                     formation=None, held_positions=None, alts=None, force_cell=None):
+                     formation=None, held_positions=None, alts=None, force_cell=None, age_override=None):
     """[2026-09 신설, _rebalance_squad_sizes에서 분리] 특정 팀에 유망주
     `need`명을 새로 만들어 ai_players INSERT용 row 튜플 리스트로 돌려준다
     — 로직은 원래 _rebalance_squad_sizes의 "n < _lo_size" 분기와 완전히
@@ -10059,10 +10137,10 @@ def _gen_topup_rows(c, tid, tier, cname, continent, tname, grade, need,
         _lg_book = _CL.TeamBook(tid, formation, _CL.target_size(grade, tier, tid in _youth_aff(c)))
         _sp_on = _sp_l.active()
         for _pid_l, _p_l, _o_l in roster_by_team.get(tid, []):
-            _lg_book.add(_pid_l, _p_l, (_sp_l.get(_pid_l) if _sp_on else None), _o_l)
+            _lg_book.add(_pid_l, _p_l, (_sp_l.entry(_pid_l) if _sp_on else None), _o_l)
     for _i in range(need):
         _sq_cov_need = [p for p in _sq_cover if _sq_have[p] == 0]
-        if force_cell is not None and _CL.full():
+        if force_cell is not None and (_CL.full() or _VY.standalone()):   # [2026-11-26] 단독 모드 유스 생성도 칸 지정
             _tp = force_cell
         elif _sq_gk_now < _sq_c.SQUAD_TARGET_MIN_AVAILABLE_GK:
             _tp = "GK"                             # 확정 보충(난수 미소비)
@@ -10138,7 +10216,8 @@ def _gen_topup_rows(c, tid, tier, cname, continent, tname, grade, need,
                                             slot_ovr=target, youth=(tier or 1) <= YOUTH_PATH_MAX_TIER,
                                                   youth_top=(tier or 1) == 1)   # [2026-10 A-2]
         _note_star_pick(tid, pos, nat, cname, _is_star_n, _fb_tu, quota)   # [2026-10] STAR_NAT_IGNORE_QUOTA
-        age = _roll_newbie_age(tid, nat, cname)   # 산하팀(유스 영입) 17~21 / 외국인 18~23 / 자국 16~24
+        # [2026-11-26 VY_STANDALONE] age_override: 유스팀 생성 나이(15~21)를 호출 쪽이 정해 준다 — 없으면 기존 그대로.
+        age = age_override if age_override is not None else _roll_newbie_age(tid, nat, cname)   # 산하팀(유스 영입) 17~21 / 외국인 18~23 / 자국 16~24
         _scaled = _youth_target_scale(target, age)
         if ovr_rng:
             _prestige_base = {3: 1, 2: 2, 1: 3}.get(_plvl, 4)
@@ -10361,7 +10440,7 @@ def _youth_exact26(c, year):
             name_cache = _build_name_cache(c)
         b = _CL.TeamBook(tid, form, 26)
         for x in ros:
-            b.add(x[0], x[1], (_sp.get(x[0]) if _on else None), x[2] or 0)
+            b.add(x[0], x[1], (_sp.entry(x[0]) if _on else None), x[2] or 0)
         for k in range(need_gk + need_f):
             cell = "GK" if k < need_gk else _CL.pick_cell_book(b, random, SQUAD_TARGET_EXCEPTION_PROB)
             fct = sum(1 for x in ros if is_roster_foreign(x[3], cname))
@@ -10369,7 +10448,7 @@ def _youth_exact26(c, year):
                                    {tid: [(x[0], x[1], x[2]) for x in ros]}, name_cache, year,
                                    cname in COUNTRY_LEAGUE_OVR_OVERRIDE, foreign_ct0=fct, src_tag="youth_26",
                                    formation=form,
-                                   held_positions=[(x[1], (_sp.get(x[0]) if _on else None)) for x in ros],
+                                   held_positions=[(x[1], (_sp.entry(x[0]) if _on else None)) for x in ros],
                                    force_cell=cell)
             if not rows:
                 _VY.STATS["youth26_fail"] += 1
@@ -10384,10 +10463,10 @@ def _youth_exact26(c, year):
     return made, trimmed
 
 
-def _ledger_source_promote(c, LG, S, X, cell, lo, year, mid=False):
+def _ledger_source_promote(c, LG, S, X, cell, lo, year, mid=False, main_only=False, cov_d0=None):
     """[2026-11-22 1단계] 공급원(실제 산하팀 → 없으면 가상 유스) 승격 1명 — 장부 후보 판정(source_candidate) 뒤 DB 반영
     (이적료 0, 일반 연봉·계약 규칙, 이적 기록 "유스 승격(공급원)"). 반환 (선수, 출처, 종류) 또는 None."""
-    sc = LG.source_candidate(S, X, cell, lo)
+    sc = LG.source_candidate(S, X, cell, lo, main_only=main_only, cov_d0=cov_d0)   # [2026-11-25 장부 R1] 주포 부족 게이트면 주포만(need_cov면 장부 부족 복원도 확인)
     if sc is None:
         return None
     p, src, kind = sc
@@ -10404,7 +10483,8 @@ def _ledger_gate_departure(c, LG, S, X, year, allow_newbie=True):
         return True
     if dep["gk"]:
         return False
-    R = LG.find_R(S, X, dep["cell"], dep["ref"], dep["d0"])
+    R = LG.find_R(S, X, dep["cell"], dep["ref"], dep["d0"], main_only=bool(dep.get("main")),
+                                    cov_d0=(dep["d0"] if dep.get("need_cov") else None))
     if R is not None:
         rs = LG.pinfo[R][0]
         _ledger_db_transfer(c, LG, R, rs, S, year, "보충 영입")
@@ -10415,14 +10495,16 @@ def _ledger_gate_departure(c, LG, S, X, year, allow_newbie=True):
             _CL.LOG["n9_violation"] += 1
         return True
     if _VY.stage1():
-        _sp = _ledger_source_promote(c, LG, S, X, dep["cell"], dep["ref"] - _CL.M_REPL, year)
+        _sp = _ledger_source_promote(c, LG, S, X, dep["cell"], dep["ref"] - _CL.M_REPL, year,
+                                     main_only=bool(dep.get("main")),
+                                    cov_d0=(dep["d0"] if dep.get("need_cov") else None))
         if _sp is not None:
             _CL.LOG[f"path_source|{_sp[2]}"] += 1
             _c3, _a3, _d3 = LG.books[S].d_change(drop=(X,))
             if _CL.worse(_d3, dep["d0"]):
                 _CL.LOG["n9_violation"] += 1
             return True
-    if allow_newbie and dep["lvl"] == 3:
+    if allow_newbie and _CL.newbie_lvl_ok(dep):
         row = _ledger_make_newbie(c, LG, S, dep["cell"], year, "sale_newbie", drop=X)
         _CL.LOG["path_newbie_gen"] += 1
         if row is not None:
@@ -10452,7 +10534,7 @@ def _ledger_excess_picks(roster, formation, grade, tier, youth, k, protected, t_
     b = _CL.TeamBook(0, formation, _T_book)
     _on = _sp_x.active()
     for pid, pos, ovr in roster:
-        b.add(pid, pos, (_sp_x.get(pid) if _on else None), ovr)
+        b.add(pid, pos, (_sp_x.entry(pid) if _on else None), ovr)
     ovr_of = {pid: (ovr or 0) for pid, _p, ovr in roster}
     picks = []
     for _ in range(k):
@@ -10482,6 +10564,9 @@ def _supply_cap_swap_pick(c, LG, b, year):
             f"SELECT id FROM ai_players WHERE COALESCE(created_year,0)=? AND COALESCE(creation_source,'')!='seed' "
             f"AND id IN ({','.join('?' * len(cands))})", (year, *cands))}
         cands = [p for p in cands if p not in made]
+        if cands and _YR.on():
+            _yr_fresh = _YR.fresh_ids(c, year)   # [2026-11-25 유스 개편] 이번 오프시즌 육성 승격·외부 데뷔 선수도 올해 만든 선수처럼
+            cands = [p for p in cands if p not in _yr_fresh]
     if not cands:
         return None
     return min(cands, key=lambda p: (LG.pinfo[p][3] or 0, p))
@@ -10616,7 +10701,7 @@ def _ledger_supply_pass(c, year):
                             d_ch = cb.d()
                             cands = sorted(((LG.pinfo[p][3], p) for p in cb.players
                                             if p > 0 and LG.pinfo[p][1] != "GK" and not LG.pinfo[p][6]
-                                            and not LG.moved(p) and cell in _CL.cells_of(*LG.pinfo[p][1:3])),
+                                            and not LG.moved(p) and cell in _CL.cell_list(*LG.pinfo[p][1:3])),
                                            reverse=True)
                             for _o, p in cands:
                                 # [2026-11-22 승인 조건 5] 유스팀의 선발·규칙 부족량(d1, d2)이 늘면 올리지 않는다
@@ -10883,7 +10968,7 @@ def _squad_target_inputs(c, with_roster=False):
     if with_roster:
         roster_by_team: dict = {}
         if _subp_active():
-            from sub_positions import get as _subp_get
+            from sub_positions import entry as _subp_get   # [2026-11-25 SUB_POS_V2] 2개면 튜플(1개면 예전 값)
             for r in c.execute("""SELECT team_id, COALESCE(on_loan_from_team_id, 0), position, id, ovr
                                   FROM ai_players"""):
                 roster_by_team.setdefault(r[0], []).append((r[3], r[2], r[4]))
@@ -10897,7 +10982,7 @@ def _squad_target_inputs(c, with_roster=False):
     if _subp_active():
         # [2026-10 주포·부포] 부포 보유자가 있을 때만 (등록 포지션, 부포) 쌍 — _gen_topup_rows가
         # squad_targets.held_assign으로 선수 1명을 정확히 1칸에 배정한다. 부포가 없으면 아래 예전 경로.
-        from sub_positions import get as _subp_get
+        from sub_positions import entry as _subp_get   # [2026-11-25 SUB_POS_V2] 2개면 튜플(1개면 예전 값)
         for r in c.execute("""SELECT team_id, COALESCE(on_loan_from_team_id, 0), position, id
                               FROM ai_players"""):
             owner = r[1] or r[0]
@@ -11135,6 +11220,10 @@ def _fill_offer_vacancies(year, team_ids=None, mode="vacancy"):
                                          held_positions=_sq_owned.get(r["tid"], [])))
         filled += 1
 
+    if new_rows and _YS.on():
+        # [2026-11-26 VY_STANDALONE] 공석 보충 신인 대신 유스 데뷔(시즌 중 이동으로 기록)
+        new_rows = _YS.substitute(c, year, new_rows, 27, ("offer_vacancy" if mode == "vacancy" else "squad_topup"),
+                                  mid=True)
     if new_rows:
         _debut_after_id = c.execute("SELECT COALESCE(MAX(id), 0) FROM ai_players").fetchone()[0]   # [2026-11-01 신민용 승인 — 시즌 중 생성 선수 첫 OVR 기록]
         c.executemany("""INSERT INTO ai_players
@@ -11257,7 +11346,7 @@ def _sq_alt_map(c, formation_by_team):
 def _sq2_entries(roster):
     import sub_positions as _sp
     on = _sp.active()
-    return [(p, (_sp.get(pid) if on else None)) for pid, p, _o in roster]
+    return [(p, (_sp.entry(pid) if on else None)) for pid, p, _o in roster]
 
 
 def _sq2_protected(roster, formation, alts):
@@ -11766,6 +11855,9 @@ def _rebalance_squad_sizes(c, year):
     # [2026-11-22 1단계] 실제 유스팀 인원·GK·포지션은 오프시즌 끝 _youth_exact26 한 곳에서 맞춘다 — 여기서 유스팀을
     # 줄이고(빈자리 −1·포지션 맞바꾸기) 끝에서 다시 만드는 생성 → 정리 반복(기준 S10b)을 막으려고 유스팀은 건너뛴다.
     _vy_skip_youth = set(_youth_aff(c)) if _VY.stage1() else set()
+    # [2026-11-25 유스 개편] 유예 중인 육성 승격 선수 수(최대 유스 전용 정원)만큼 상한을 늘린다 — 꺼져 있으면 빈 dict
+    _yr_allow = _YR.allowance_map(c, year) if _YR.on() else {}
+    _yr_fresh = _YR.fresh_ids(c, year) if _YR.on() else set()   # 이번 오프시즌 육성 승격·외부 데뷔 — 조기 은퇴 보호
 
     for tid, (tier, cname, continent, tname) in team_info.items():
         if tid in _vy_skip_youth:
@@ -11805,6 +11897,10 @@ def _rebalance_squad_sizes(c, year):
         elif tid in _my_dest_ids:
             _lo_size -= 1
             _hi_size -= 1
+        if _yr_allow.get(tid):
+            _hi_size += _yr_allow[tid]
+            _hi_size_gk += _yr_allow[tid]
+            _CL.LOG["yr|rebalance_allow"] += _yr_allow[tid] if n > _hi_size - _yr_allow[tid] else 0
 
         if n < _lo_size:
             need = _lo_size - n
@@ -11849,6 +11945,8 @@ def _rebalance_squad_sizes(c, year):
                     _protected_max = _protected_max | _sq_gk_ids
                 _protected_max = _protected_max | _sq2_protected(roster, _sq_form.get(tid),
                                                                  _sq_alts.get(tid))
+            if _yr_fresh:
+                _protected_max = _protected_max | {_pid for _pid, _ppos, _povr in roster if _pid in _yr_fresh}
             _candidates = sorted(roster, key=lambda t: t[2])  # 기존과 동일: OVR 오름차순
             # [2026-11-18 측면 좌우 균형] 순서는 그대로, 측면 차이를 허용치 넘게 벌리는 선수만 뒤로 미룬다.
             if _CL.full():
@@ -12168,6 +12266,9 @@ def _rebalance_squad_sizes(c, year):
                 topped_up += 1
             foreign_now[tid] = _gf_fc
 
+    if new_rows and _YS.on():
+        # [2026-11-26 VY_STANDALONE] 인원 보충 신인 대신 유스 데뷔(squad_topup 행만 — GK 보충·포지션 교체 행은 그대로)
+        new_rows = _YS.substitute(c, year, new_rows, 27, "squad_topup")
     if new_rows:
         # [2026-09 신설, database.true_nationality 컬럼 주석 참고] 포지션
         # 뎁스 보충으로 새로 태어나는 선수도 은퇴대체와 동일하게 nationality/
@@ -13736,6 +13837,11 @@ def _blend_real_rows(c, rows_list, comp, year, team_col, team_totals, by_team=Fa
             row[3], row[4], row[5], row[6], row[7], row[8], row[9], rr, frac)
 
 
+# [2026-11-26 신설] 국가대표 골·도움 출전 보정 지수 = 1 − 0.35(_estimate_ai_season의 (경기 수/38)^0.35) —
+# _snapshot_intl_ratings_rows (1-c) 참고.
+_INTL_APPS_LINEAR_EXP = 0.65
+
+
 def _snapshot_intl_ratings_rows(c, rows):
     """[2026-09 신설] _snapshot_intl_tournament_ratings/_snapshot_intl_season_
     ratings 공유 핵심 로직 — 주어진 intl_squad 행들(이미 tournament_id로
@@ -13857,7 +13963,60 @@ def _snapshot_intl_ratings_rows(c, rows):
     # 자체가 없어 그대로 통과한다.
     _budget = {k: max(0, _real.get(k, 0) - _mine.get(k, 0))
                for k in set(keys) if _played.get(k, 0) > 0}
+    # ── (1-c) [2026-11-26 버그수정, 신민용 확정] 출전 비례 — 위 추정(_estimate_ai_season)은 full_season_matches에
+    #        그 선수 출전 수를 넣어 (출전/38)^0.35로만 줄였다. 0.35승은 리그 규모용 완만한 스케일이지 출전시간용이
+    #        아니라(리그 경로 _snapshot_season_ratings 주석 — 그쪽은 팀 경기 수 + 선형 출전 비율로 이미 고침),
+    #        1경기 교체 선수도 6경기 주전의 약 53%를 받았다(2000 유럽 네이션스컵 예선: 1경기 교체 ST 6골 1도움).
+    #        리그와 같은 기준 = (팀 경기/38)^0.35 × (출전/팀 경기)이므로 지금 값에 (출전/팀 경기)^0.65만 곱한다.
+    #        팀 경기 = 그 나라가 이 대회에서 치른 경기(intl_matches), 그보다 많이 뛴 선수가 있으면 그 출전 수.
+    #        실득점 배분(아래) 직전에 가중치만 바꾸므로 팀 골·도움 합계는 그대로고, 난수는 전혀 쓰지 않는다
+    #        (추정·뎁스 감쇠·에이스 집중의 난수 소비 순서·횟수 그대로). 배분 대상 팀(_budget)만 — 아직 안 치른
+    #        대회는 예전처럼 건너뛴다. 클린시트·선방·실점은 원래 출전 수에 선형이라 건드리지 않는다.
+    _team_n = {}
+    for d in _depth_rows:
+        k = d["key"]
+        if k in _budget:
+            _ap = d["apps"]
+            _n0 = _team_n.get(k)
+            _team_n[k] = max(_played.get(k, 0), _ap) if _n0 is None else max(_n0, _ap)
+    #        팀 도움 예산은 _apply_team_goal_budget이 (추정 도움 합 ÷ 추정 골 합) 비율로 정한다 — 보정 전 합계로
+    #        예전과 똑같이 계산한 예산(_a_target)으로 다시 나눠 팀 도움 합계를 예전 그대로 둔다(사람마다 몫만 바뀜).
+    #        비율을 배율로 맞추면 예산이 정확히 .5에 걸린 팀에서 부동소수점 오차로 반올림이 갈린다(헤드리스 2001 실측 1팀).
+    _gw0, _aw0 = {}, {}
+    for d in _depth_rows:
+        k = d["key"]
+        if k not in _team_n:
+            continue
+        # 합은 _apply_team_goal_budget과 똑같이 만든다(같은 그룹 안 행 순서의 리스트, 0 이하는 0.0, 내장 sum —
+        # 파이썬 3.12+ sum()은 보정 합산이라 += 누적과 끝자리가 다를 수 있다) — 같은 float이 나온다.
+        _v = d["goals"]
+        _gw0.setdefault(k, []).append(float(_v) if _v and _v > 0 else 0.0)
+        _v = d["assists"]
+        _aw0.setdefault(k, []).append(float(_v) if _v and _v > 0 else 0.0)
+        _n = _team_n[k]
+        _ap = d["apps"]
+        if 0 < _ap < _n:
+            _f = (_ap / _n) ** _INTL_APPS_LINEAR_EXP
+            if d["goals"]:
+                d["goals"] = d["goals"] * _f
+            if d["assists"]:
+                d["assists"] = d["assists"] * _f
+    _a_w = {}
+    for d in _depth_rows:
+        if d["key"] in _team_n:
+            _v = d["assists"]
+            _a_w.setdefault(d["key"], []).append((d, float(_v) if _v and _v > 0 else 0.0))
     _apply_team_goal_budget(_depth_rows, lambda d: d["key"], _budget, allow_zero=True)
+    from game_engine import _alloc_int_by_weights
+    for k, _mem in _a_w.items():
+        _rg = int(_budget[k])
+        _a_target = 0
+        _gs0 = sum(_gw0.get(k, ()))
+        if _rg > 0 and _gs0 > 0:
+            _a_target = min(_rg, int(round(_rg * sum(_aw0[k]) / _gs0)))
+        if sum(d["assists"] for d, _w in _mem) != _a_target:
+            for (d, _w), _a in zip(_mem, _alloc_int_by_weights([_w for _d, _w in _mem], _a_target)):
+                d["assists"] = _a
     for u, d in zip(updates, _depth_rows):
         u[1], u[2] = d["goals"], d["assists"]
         u[3], u[4], u[5] = d["clean_sheets"], d["saves"], d["goals_conceded"]
@@ -14173,6 +14332,7 @@ def my_role_in_team(c, team_id, me, exclude_ids=()):
     _my_sub_now = _subp_my_sub() if _subp_active() else None
     if _my_sub_now:
         candidates[-1]["sub_pos"] = _my_sub_now
+        _set_my_sub2(candidates[-1])   # [2026-11-25 SUB_POS_V2] 내 부포 2개면 두 번째도
     placed = _club_fill(candidates, slots)
     started_ids = {pl["id"] for pl in placed if pl is not None}
     # [2026-09 재설계] roles는 이제 실제 슬롯 배정(started_ids)을 그대로
@@ -15190,6 +15350,10 @@ def _affiliate_intake(c, year, departed):
                                         src_tag="youth_intake",
                                         formation=_sq_form.get(r["tid"]),
                                         held_positions=_sq_owned.get(r["tid"], [])))
+    _n_intake = len(new_rows)
+    if new_rows and _YS.on():
+        # [2026-11-26 VY_STANDALONE] B팀(산하팀) 유스 영입도 모구단 U-21에서 먼저(U-21 → B팀 → 1군 사다리), 없으면 신인
+        new_rows = _YS.substitute(c, year, new_rows, 27, "youth_intake")
     if new_rows:
         c.executemany("""INSERT INTO ai_players
             (team_id,name,position,stamina,speed,jump,strength,shooting,passing,
@@ -15198,8 +15362,8 @@ def _affiliate_intake(c, year, departed):
              true_nationality,contract_end_year,last_transfer_year,created_year,potential_ovr,
              salary,creation_source)
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", new_rows)
-    YOUTH_STATS["intake"] += len(new_rows)
-    return len(new_rows)
+    YOUTH_STATS["intake"] += _n_intake   # 유스에서 올라온 선수 포함(영입 인원 자체는 그대로)
+    return _n_intake
 
 
 def _enforce_foreign_quota_worldwide(c, year, only_tids=None, mid_season=0):
@@ -17365,7 +17529,7 @@ class _FormCands:
             allowed = None
             if self._formable:
                 from squad_targets import formable as _sq_formable
-                _ent = [(p.get("position"), p.get("sub_pos")) for p in roster]
+                _ent = [(p.get("position"), _subp.dict_entry(p)) for p in roster]
                 allowed = {f for f in FORMATION_SLOTS if _sq_formable(_ent, f)} or None
             v = frozenset(_flogic.formation_candidate_set(
                 _flogic.prep_roster(roster), cur, tend, style=self._style.get(tid),
@@ -17463,10 +17627,11 @@ def _shuffle_formations(c, forced_teams=None):
             # 선수단을 재추첨이 다시 깨지 않게(1시즌 실측: 바뀐 1군 약 3,200팀 중 약 1,700팀이 새 포메이션 선발 부족).
             if (getattr(_sq_c, "WORLD_SQUAD_BY_FORMATION", False) or getattr(_sq_c, "SQUAD_BY_FORMATION_V3", False)
                     or getattr(_sq_c, "SQUAD_BY_FORMATION_V31", False)
-                    or (getattr(_sq_c, "FORMATION_REEVAL_FORMABLE", False) and _CL.full())):
+                    or (getattr(_sq_c, "FORMATION_REEVAL_FORMABLE", False)
+                        and (_CL.full() or getattr(_sq_c, "FORMATION_REEVAL_FORMABLE_ALWAYS", False)))):   # [2026-11-24 (가)]
                 # [2026-10-31] V3도 같은 후보 제외(선발 11명을 못 채우는 포메이션으로 바꾸지 않는다).
                 from squad_targets import formable as _sq_formable
-                _ent = [(p.get("position"), p.get("sub_pos")) for p in roster]
+                _ent = [(p.get("position"), _subp.dict_entry(p)) for p in roster]
                 _allowed = {f for f in FORMATION_SLOTS if _sq_formable(_ent, f)}
                 SQ2_LOG["form_reeval"] = SQ2_LOG.get("form_reeval", 0) + 1
                 SQ2_LOG["form_excluded"] = SQ2_LOG.get("form_excluded", 0) + (len(FORMATION_SLOTS) - len(_allowed))
@@ -17675,7 +17840,7 @@ def apply_squad_turnover_after_movement(rescale_jobs, year, turnover_frac=0.25,
             _lg_tb = _CL.TeamBook(team_id, (_fm_t[0] if _fm_t else None),
                                   _CL.target_size(grade, tier, team_id in _youth_aff(c)))
             for _p in squad:
-                _lg_tb.add(_p["id"], _p["position"], (_sp_t.get(_p["id"]) if _sp_t.active() else None), _p["ovr"])
+                _lg_tb.add(_p["id"], _p["position"], (_sp_t.entry(_p["id"]) if _sp_t.active() else None), _p["ovr"])
         for i, pl in enumerate(squad[:n_turn]):
             del_ids.append(pl["id"])
             pos = pl["position"]
@@ -17740,6 +17905,9 @@ def apply_squad_turnover_after_movement(rescale_jobs, year, turnover_frac=0.25,
     if del_ids:
         _archive_forced_out_players(c, del_ids, year)
         c.executemany("DELETE FROM ai_players WHERE id=?", [(i,) for i in del_ids])
+    if new_rows and _YS.on():
+        # [2026-11-26 VY_STANDALONE] 승강 직후 물갈이 신인 대신 유스 데뷔
+        new_rows = _YS.substitute(c, year, new_rows, 27, "promo_rebuild")
     if new_rows:
         # [2026-09 신설, database.true_nationality 컬럼 주석 참고] 승강
         # 직후 스쿼드 교체로 새로 태어나는 선수도 동일하게 채운다.

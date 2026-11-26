@@ -392,6 +392,15 @@ def held_assign(entries, targets, return_assignment=False):
     prim = [REGISTERED_TO_TARGET.get(p) for p, _s in entries]
     alt = []
     for (p, s), pt in zip(entries, prim):
+        if s.__class__ is tuple:
+            # [2026-11-25 SUB_POS_V2] 부포 2개 — 주포와 다른 칸만. 1칸이면 문자열(부포 1개와 같은 경로), 2칸이면 튜플.
+            _o = []
+            for x in s:
+                _t = SLOT_TO_TARGET.get(x) if x else None
+                if pt and _t and _t != pt and _t not in _o:
+                    _o.append(_t)
+            alt.append(None if not _o else (_o[0] if len(_o) == 1 else tuple(_o)))
+            continue
         st = SLOT_TO_TARGET.get(s) if s else None
         alt.append(st if (pt and st and st != pt) else None)
     assign = list(prim)
@@ -401,8 +410,11 @@ def held_assign(entries, targets, return_assignment=False):
         if t:
             at[t].append(i)
 
-    def _other(i):
-        return alt[i] if assign[i] == prim[i] else prim[i]
+    def _others(i):
+        a_ = alt[i]
+        if a_.__class__ is tuple:   # [2026-11-25 SUB_POS_V2]
+            return [x for x in (prim[i],) + a_ if x and x != assign[i]]
+        return (a_ if assign[i] == prim[i] else prim[i],)
 
     if any(alt):
         while True:
@@ -417,15 +429,17 @@ def held_assign(entries, targets, return_assignment=False):
             while qi < len(queue) and goal is None:
                 u = queue[qi]; qi += 1
                 for i in at[u]:
-                    v = _other(i)
-                    if not v or v in seen:
-                        continue
-                    seen.add(v)
-                    parent[v] = (u, i)
-                    if cnt[v] < targets.get(v, 0):
-                        goal = v
+                    for v in _others(i):
+                        if not v or v in seen:
+                            continue
+                        seen.add(v)
+                        parent[v] = (u, i)
+                        if cnt[v] < targets.get(v, 0):
+                            goal = v
+                            break
+                        queue.append(v)
+                    if goal is not None:
                         break
-                    queue.append(v)
             if goal is None:
                 break
             v = goal

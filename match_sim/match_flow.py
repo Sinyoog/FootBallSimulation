@@ -207,10 +207,10 @@ def _select_lineup(team_id, formation, fixed=None):
 
         def _score(p):
             compat = POSITION_COMPAT.get(p.get("position"), [p.get("position")])
-            if p.get("sub_pos") and p.get("sub_pos") == slot:
-                # [2026-10 주포·부포] 부포 슬롯 = OVR −1(constants.SUB_POS_OVR_COST)
+            if (p.get("sub_pos") and p.get("sub_pos") == slot) or (p.get("sub_pos2") and p.get("sub_pos2") == slot):
+                # [2026-10 주포·부포] 부포 슬롯 = OVR −1(constants.SUB_POS_OVR_COST) — [2026-11-25] 두 번째 부포도
                 import sub_positions as _subp_m
-                _pen_v = _subp_m.sub_abs_penalty(_LINEUP_POSITION_PENALTY[1])
+                _pen_v = _subp_m.sub_abs_penalty(_LINEUP_POSITION_PENALTY[1], p.get("position"), slot)
             else:
                 try:
                     idx = compat.index(slot)

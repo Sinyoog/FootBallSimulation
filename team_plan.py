@@ -496,6 +496,7 @@ def my_lineup_candidate(p, base=None):
         _sp = _subp.my_sub()
         if _sp:
             d["sub_pos"] = _sp
+            _subp.set_my_sub2(d)        # [2026-11-25 SUB_POS_V2] 내 부포 2개면 두 번째도
     except Exception:
         pass
     return d

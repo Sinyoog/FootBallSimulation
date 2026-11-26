@@ -263,6 +263,8 @@ def search_teams(name_query=None, continent=None, country_id=None, grade=None, t
 # get_ai_player_detail()에 시즌별 기록을 추가하는 식으로 확장한다.
 # [2026-10 주포·부포] 부포 조회(sub_positions.py) — 스위치 OFF면 get()은 항상 None.
 from sub_positions import get as _subp_get, enabled as _subp_enabled
+from sub_positions import (search_table as _subp_search_table, hist_subs as _subp_hist,   # [2026-11-25 SUB_POS_V2]
+                           sub_for_cell as _subp_for_cell, display_subs as _subp_display)
 MY_PLAYER_ID = -1  # [2026-08 신설] "선수 검색" 결과에서 my_player(사용자
 # 본인 캐릭터)를 가리키는 예약 id. 실제 ai_players.id는 항상 1 이상의
 # 양수 autoincrement라 절대 충돌하지 않는다.
@@ -674,8 +676,8 @@ def search_retired_ai_players(name_query=None, continent=None, nat_country_id=No
             q += " AND r.nationality=?"; params.append(nat_row["name"])
         if position:
             if _subp_enabled():   # [2026-10 주포·부포] 부포로도 검색(스위치 OFF면 예전 SQL 그대로)
-                q += (" AND (r.position=? OR r.id IN (SELECT player_id FROM ai_player_sub_positions"
-                      " WHERE position=?))"); params.extend([position, position])
+                q += (" AND (r.position=? OR r.id IN (SELECT player_id FROM " + _subp_search_table() +
+                      " WHERE position=?))"); params.extend([position, position])   # [2026-11-25] V2면 새 표
             else:
                 q += " AND r.position=?"; params.append(position)
         if min_age is not None:
@@ -1045,8 +1047,8 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
         q += " AND l.tier=?"; params.append(tier)
     if position:
         if _subp_enabled():   # [2026-10 주포·부포] 부포로도 검색(스위치 OFF면 예전 SQL 그대로)
-            q += (" AND (p.position=? OR p.id IN (SELECT player_id FROM ai_player_sub_positions"
-                  " WHERE position=?))"); params.extend([position, position])
+            q += (" AND (p.position=? OR p.id IN (SELECT player_id FROM " + _subp_search_table() +
+                  " WHERE position=?))"); params.extend([position, position])   # [2026-11-25] V2면 새 표
         else:
             q += " AND p.position=?"; params.append(position)
     if min_age is not None:
@@ -1391,6 +1393,7 @@ def get_ai_player_detail(player_id):
                 except Exception:
                     d["manager_job"] = ""
             d["sub_position"] = _subp_get(player_id)   # [2026-10 주포·부포] 은퇴 선수도 부포 표시
+            d["sub_positions"] = _subp_display(player_id, d.get("position"))   # [2026-11-25] [(부포, 종류)] 최대 2개
             conn.close()
             return d
         d = dict(row)
@@ -1410,6 +1413,7 @@ def get_ai_player_detail(player_id):
             d["power_rank_continent"] = crank
             d["power_rank_country"] = ctry_rank
     d["sub_position"] = _subp_get(player_id)   # [2026-10 주포·부포] 없으면 None
+    d["sub_positions"] = _subp_display(player_id, d.get("position"))   # [2026-11-25] [(부포, 종류)] 최대 2개
     conn.close()
     return d
 
@@ -1484,6 +1488,65 @@ def get_ai_player_salary_history(player_id):
     return [(y, s, tt, il, fe, ce, lry, _ms) for (y, s, tt, il, fe, ce, _ms, lry) in out]
 
 
+def _youth_team_labels(conn, team_ids):
+    """[2026-11-26 신설, 신민용 요청: "프로 데뷔 전 유스팀에 있었으면 연도별 기록에 '도르트문트 U-21'로"]
+    가상 유스 팀(teams.classification_status='VIRTUAL_YOUTH', 리그 없는 첼시 U-21형) id → (표시 이름 "모구단 U-21", 나라).
+    가상 유스 팀이 아닌 id는 결과에 없다(실제 리그를 뛰는 산하팀은 예전 그대로 리그 팀으로 보인다). 읽기 전용."""
+    out = {}
+    ids = sorted({int(t) for t in team_ids if t})
+    if not ids:
+        return out
+    try:
+        for k in range(0, len(ids), 500):
+            part = ids[k:k + 500]
+            for r in conn.execute(
+                    f"""SELECT t.id, t.name, p.name, cn.name FROM teams t
+                        LEFT JOIN teams p ON p.id = t.parent_team_id
+                        LEFT JOIN countries cn ON cn.id = t.country_id
+                        WHERE t.classification_status = 'VIRTUAL_YOUTH' AND t.id IN ({','.join('?' * len(part))})""",
+                    part):
+                base = r[2] or (r[1][:-3] if (r[1] or "").endswith(" 유스") else (r[1] or "?"))
+                out[r[0]] = (f"{base} U-21", r[3])
+    except Exception:   # 구세이브(열 없음) 등 — 유스 표시 없이 예전 그대로
+        return {}
+    return out
+
+
+def _youth_stage_name(label, age, aff_parent=False):
+    """[2026-11-26 신민용 요청: "16세엔 U-18에 있다가 U-21로 바뀌어야 하는데 다 U-21로 뜬다"] 가상 유스 표시 이름
+    ("모구단 U-21")을 그 해 나이에 맞게 바꾼다 — 18세 이하 U-18, 19세 이상 U-21(constants.VY_V3_U18_MAX_AGE). 유스 생성 V3
+    (VY_GEN_V3)에서 산하팀(B·C팀)이 있는 구단의 유스는 U-18 한 단계뿐이라 나이와 관계없이 U-18. 나이를 모르면 그대로."""
+    import constants as _Cw
+    base = label[:-5] if (label or "").endswith(" U-21") else label
+    if aff_parent and getattr(_Cw, "VY_GEN_V3", False):
+        return f"{base} U-18"
+    if age is None:
+        return label
+    return f"{base} U-18" if age <= int(getattr(_Cw, "VY_V3_U18_MAX_AGE", 18)) else f"{base} U-21"
+
+
+def _youth_aff_parent(team_ids):
+    """{가상 유스 팀 id: 모구단에 산하팀(AFFILIATE)이 있는가} — 읽기 전용."""
+    out = {}
+    ids = sorted({int(t) for t in team_ids if t})
+    if not ids:
+        return out
+    conn = get_conn()
+    try:
+        for k in range(0, len(ids), 500):
+            part = ids[k:k + 500]
+            for vt, has in conn.execute(
+                    f"""SELECT v.id, EXISTS(SELECT 1 FROM teams a WHERE a.parent_team_id = v.parent_team_id
+                                            AND a.classification_status = 'AFFILIATE')
+                        FROM teams v WHERE v.id IN ({','.join('?' * len(part))})""", part):
+                out[vt] = bool(has)
+    except Exception:
+        return {}
+    finally:
+        conn.close()
+    return out
+
+
 def get_ai_player_team_timeline(player_id, current_team_id):
     """[2026-08 신설, 신민용 요청: "소속팀 대회 기록 박스에서 순위가
     아니라 이 선수가 그 해에 실제로 어느 팀 소속이었는지 나와야 한다"]
@@ -1541,6 +1604,10 @@ def get_ai_player_team_timeline(player_id, current_team_id):
     ph = ",".join("?" * len(team_ids))
     name_by_tid = {r["id"]: r["name"] for r in
                    conn.execute(f"SELECT id, name FROM teams WHERE id IN ({ph})", list(team_ids))}
+    # [2026-11-26] 가상 유스(U-21) 구간 — 이름은 "모구단 U-21", 연도별 기록에서 리그 칸 "유스"로 따로 그린다.
+    _yl = _youth_team_labels(conn, team_ids)
+    for _yt, (_ylabel, _yc) in _yl.items():
+        name_by_tid[_yt] = _ylabel
     conn.close()
 
     # [2026-08 버그수정, 신민용 스크린샷 리포트: "선수 검색에 그 해 이전
@@ -1566,14 +1633,16 @@ def get_ai_player_team_timeline(player_id, current_team_id):
     segments = [{"start_year": None, "end_year": _eff_year(rows[0]),
                  "team_id": rows[0]["from_team_id"],
                  "team_name": name_by_tid.get(rows[0]["from_team_id"], "?"),
-                 "position": rows[0]["player_position"] or None, "is_loan": False}]
+                 "position": rows[0]["player_position"] or None, "is_loan": False,
+                 "is_youth": rows[0]["from_team_id"] in _yl}]
     for i, r in enumerate(rows):
         end = _eff_year(rows[i + 1]) if i + 1 < len(rows) else None
         segments.append({"start_year": _eff_year(r), "end_year": end,
                           "team_id": r["to_team_id"],
                           "team_name": name_by_tid.get(r["to_team_id"], "?"),
                           "position": r["player_position"] or None,
-                          "is_loan": bool(r["is_loan"])})
+                          "is_loan": bool(r["is_loan"]),
+                          "is_youth": r["to_team_id"] in _yl})
     return segments
 
 
@@ -1722,6 +1791,7 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
         return _hist_cache[_k]
 
     merged_by_year = {}
+    _yaff = _youth_aff_parent([s["team_id"] for s in timeline if s.get("is_youth")])   # [2026-11-26] U-18/U-21 표시
     for seg in timeline:
         seg_start = seg["start_year"]
         seg_end = seg["end_year"] if seg["end_year"] is not None else ceiling
@@ -1729,6 +1799,29 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
             seg_start = earliest_debut_year if seg_start is None else max(seg_start, earliest_debut_year)
         if seg_start is None:
             seg_start = -1  # 출생년도를 모르면(현역이면서 age 정보 자체가 없는 예외) 자르지 않는다
+        if seg.get("is_youth"):
+            # [2026-11-26 신민용 요청] 가상 유스(U-21) 시절 — 리그·컵 기록이 없는 팀이라 팀 성적 대신 리그 칸 "유스"
+            # 한 줄을 그 해마다 만든다. 시작은 그 선수의 첫 OVR 기록 연도(= 유스에 실제로 있던 첫 시즌, 월드 시작
+            # 이전 연도는 기록이 없으므로 만들지 않는다), 끝은 유스를 떠난 해(여름이면 그 해까지, 겨울이면 상반기
+            # 줄로 따로 나온다). 첫 OVR 기록을 모르면(earliest_debut_year 없음) 만들지 않는다.
+            if seg_start == -1 or _earliest_known_year is None:
+                continue
+            # [2026-11-26] 유스는 15세부터 있으므로(VY_SA_AGE) 16세 데뷔 하한 대신 15세 하한 — 첫 OVR 기록 연도부터
+            _ys0 = max(_earliest_known_year, (birth_year + 15) if birth_year is not None else _earliest_known_year)
+            if seg["start_year"] is not None:
+                _ys0 = max(_ys0, seg["start_year"])
+            for y in range(_ys0, min(seg_end, ceiling)):
+                merged_by_year[y] = {
+                    "year": y, "league": "유스", "cup": None, "cl": None, "cwc": None, "sc": None, "dsc": None,
+                    "league_record": None, "cup_record": None, "cl_record": None, "cwc_record": None,
+                    "sc_record": None, "dsc_record": None, "league_champion": False, "cup_champion": False,
+                    "cwc_champion": False, "cl_champion": False, "cl_kind": None, "sc_champion": False,
+                    "dsc_champion": False, "is_loan": False, "_team_id_for_salary": seg["team_id"],
+                    "_is_youth": True,
+                    # [2026-11-26] 그 해 나이로 U-18/U-21 — UI가 팀 칸에 이 이름을 쓴다
+                    "_youth_team_name": _youth_stage_name(seg["team_name"], (y - birth_year) if birth_year is not None
+                                                          else None, _yaff.get(seg["team_id"], False))}
+            continue
         team_hist = _hist_for(seg["team_id"], None if seg_start == -1 else seg_start, seg_end)
         for entry in team_hist["years"]:
             y = entry["year"]
@@ -2175,7 +2268,8 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
                                "goals_conceded": _lg_comp.get("goals_conceded")},
                     main_entry=e, full_role=(_h2_role_by_year.get(y) if y in _role_diff_years
                                              else None) or _full_role_by_year.get(y),
-                    split=(_team_split.get(y) if y in mid_by_year else None))
+                    split=(_team_split.get(y) if y in mid_by_year else None),
+                    youth_age=((y - birth_year) if birth_year is not None else None))
                 # [2026-09 버그수정, 신민용 리포트: "브라이턴(상반기/원래
                 # 팀) 이때 시작·이적료 이런 게 아예 표시가 안 된다"]
                 # _half_season_league_entry는 리그 성적만 채우고 salary
@@ -2359,7 +2453,7 @@ def _lineup_h2_role(conn, team_id, year, player_id, cur_year=None):
 
 
 def _half_season_league_entry(conn, team_id, year, half_position=None, half_role=None,
-                                full_stat=None, main_entry=None, full_role=None, split=None):
+                                full_stat=None, main_entry=None, full_role=None, split=None, youth_age=None):
     """[2026-08 신설, 상반기/하반기 이적 기록 분리 기능] league_season_
     standings_half(하반기 시작 순간에 떠둔 상반기까지의 순위 스냅샷)에서
     이 팀의 그 해 상반기 성적 한 줄을 만든다. get_team_history의 연도별
@@ -2405,6 +2499,11 @@ def _half_season_league_entry(conn, team_id, year, half_position=None, half_role
     _ROLE_WEIGHT["준주전"] = round(_ROLE_WEIGHT.get("주전", 40) * 0.67 / 0.80)   # [2026-11-16] 같은 출전률 비 방식
     _DEFAULT_ROLE_WEIGHT = _ROLE_WEIGHT.get("대기", 25)  # 역할 정보가 없을 때(과거 데이터 공백 등) 중간값 폴백
     trow = conn.execute("SELECT name FROM teams WHERE id=?", (team_id,)).fetchone()
+    _yl_half = _youth_team_labels(conn, [team_id])   # [2026-11-26] 가상 유스(U-21)에서 시즌 중에 떠난 해의 상반기 줄
+    if team_id in _yl_half:
+        # [2026-11-26] 그 해 나이로 U-18/U-21(youth_age를 모르면 예전 이름 그대로)
+        trow = {"name": _youth_stage_name(_yl_half[team_id][0], youth_age,
+                                          _youth_aff_parent([team_id]).get(team_id, False))}
     entry = {"year": year, "league": None, "cup": None, "cl": None, "cwc": None, "sc": None,
              "dsc": None,
              "league_record": None, "cup_record": None, "cl_record": None, "cwc_record": None,
@@ -2428,6 +2527,9 @@ def _half_season_league_entry(conn, team_id, year, half_position=None, half_role
              # 대신 이 값을 쓰면, 상반기 팀은 상반기 팀 기준 역할을 보여줄
              # 수 있다.
              "_half_role": half_role or None}
+    if team_id in _yl_half:
+        entry["league"] = "유스"
+        entry["_is_youth"] = True
     row = conn.execute(
         "SELECT league_id, wins, draws, losses, goals_for, goals_against "
         "FROM league_season_standings_half WHERE team_id=? AND year=?",
@@ -10550,6 +10652,12 @@ def get_team_countries(team_ids=(), team_names=()):
                         WHERE t.name IN ({','.join('?' * len(part))})""", part):
                 _seen.setdefault(r[0], set()).add(r[1])
         by_name = {n: next(iter(cs)) for n, cs in _seen.items() if len(cs) == 1}
+        # [2026-11-26] 가상 유스(U-21) 팀은 리그가 없어 위 조회에 안 잡힌다 — 팀의 나라로 채운다.
+        _miss = [i for i in ids if i not in by_id]
+        if _miss:
+            for _yt, (_yn, _yc) in _youth_team_labels(conn, _miss).items():
+                if _yc:
+                    by_id[_yt] = _yc
     finally:
         conn.close()
     return by_id, by_name
@@ -12106,16 +12214,11 @@ def get_slot_effective_ovrs(entries, year, ovr_by_id=None):
                 info[MY_PLAYER_ID] = (r[0], r[1], r[2] or "", r[3] or "")
         sub = {}
         if _subp_enabled() and year:
-            for k in range(0, len(ids), 500):
-                part = ids[k:k + 500]
-                try:
-                    for r in conn.execute(
-                            f"SELECT player_id, position FROM ai_player_sub_positions "
-                            f"WHERE gained_year < ? AND player_id IN ({','.join('?' * len(part))})",
-                            [int(year)] + part):
-                        sub[int(r[0])] = r[1]
-                except Exception:
-                    break
+            # [2026-11-25 SUB_POS_V2] 그 해 부포(V2면 부포 순서대로 최대 2개, 아니면 예전 표 1개)
+            try:
+                sub = _subp_hist(conn, list(ids), year)
+            except Exception:
+                sub = {}
     finally:
         conn.close()
     out = {}
@@ -12130,7 +12233,9 @@ def get_slot_effective_ovrs(entries, year, ovr_by_id=None):
             continue
         d = {"position": row[0] or "CM", "ovr": float(ovr), "foot": row[2], "sub_role": row[3]}
         if sub.get(pid):
-            d["sub_pos"] = sub[pid]
+            d["sub_pos"] = sub[pid][0]
+            if len(sub[pid]) > 1:
+                d["sub_pos2"] = sub[pid][1]
         try:
             out[pid] = _fl._slot_value(d, slot)
         except Exception:
@@ -12169,13 +12274,8 @@ def _bench_ctx_positions(year, formation, starters, bench):
         ids = [b["id"] for b in blist]
         conn = get_conn()
         try:
-            for k in range(0, len(ids), 500):
-                part = ids[k:k + 500]
-                for r in conn.execute(
-                        f"SELECT player_id, position FROM ai_player_sub_positions "
-                        f"WHERE gained_year < ? AND player_id IN ({','.join('?' * len(part))})",
-                        [int(year)] + part).fetchall():
-                    sub[int(r[0])] = r[1]
+            # [2026-11-25 SUB_POS_V2] 1개면 문자열(예전 값), 2개면 튜플 — held_assign이 둘 다 받는다
+            sub = {p: (s[0] if len(s) == 1 else s) for p, s in _subp_hist(conn, ids, year).items()}
         except Exception:
             sub = {}
         finally:
@@ -12194,7 +12294,7 @@ def _bench_ctx_positions(year, formation, starters, bench):
         assign = [REGISTERED_TO_TARGET.get(reg) for reg, _sp in entries]
     out = {}
     for b, (reg, sp), a in zip(blist, entries, assign):
-        label = sp if (sp and a and a != REGISTERED_TO_TARGET.get(reg)) else reg
+        label = (_subp_for_cell(sp, a) or reg) if (sp and a and a != REGISTERED_TO_TARGET.get(reg)) else reg
         names = slot_names.get(a) if a else None
         if names and label not in names and len(names) == 1:
             label = next(iter(names))

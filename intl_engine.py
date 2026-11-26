@@ -3294,7 +3294,7 @@ def _v4_candidates(country, year=None):
     apps = get_player_total_intl_appearances([c["id"] for c in cands])
     try:
         import sub_positions as _subp
-        _subp.attach(cands)
+        _subp.attach(cands, first_only=True)   # [2026-11-25 SUB_POS_V2] 대표팀은 첫 번째 부포만
     except Exception:
         pass
     for c in cands:
@@ -3956,7 +3956,7 @@ def _intl_rebuild_side_groups(country, quota_by_group, my_side, grp_picks, nat_b
                 orig[x["id"]] = x
                 pool.append(dict(x))
     apps = get_player_total_intl_appearances([d["id"] for d in pool])
-    _subp.attach(pool)
+    _subp.attach(pool, first_only=True)   # [2026-11-25 SUB_POS_V2] 대표팀은 첫 번째 부포만
     cands = [((intl_selection_score_v3(d, metrics.get(d["id"]), apps.get(d["id"], 0), nat=country)
                - _intl_low_league_nonstarter_penalty(d, metrics.get(d["id"]))), d) for d in pool]
     new, place, filled = {}, {}, {}
@@ -4097,7 +4097,7 @@ def intl_my_join_drops(result, my_pos, target, my_sub=None):
     rows = sorted([dict(r) for r in result], key=lambda r: ((r.get("ovr") or 0), -(r.get("age") or 0)))
     try:
         import sub_positions as _sp
-        _sp.attach(rows)
+        _sp.attach(rows, first_only=True)   # [2026-11-25 SUB_POS_V2] 대표팀은 첫 번째 부포만
     except Exception:
         pass
     n = max(0, len(rows) - target)

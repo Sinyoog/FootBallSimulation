@@ -102,6 +102,35 @@ check("D 유로파 우승 + 리그 우승 MVP → A와 D", P(el_win=True, tier1=
 check("2004 임민준형(유로파 우승·리그 MVP·공격P 1위, 챔스 없음) → A·D",
       P(el_win=True, tier1=True, big5_champ=True, league_awards={"MVP", "득점왕"}, ga_rank=1, rt_rank=1) == ["A", "D"])
 
+print("F. [2026-11-26] 1위 자격 예외(A-3) — top1_exception_paths · apply_top1_gate(exception_of)")
+X = B.top1_exception_paths
+mk = lambda ps: [{"player_id": i, "personal": p} for i, p in enumerate(ps)]
+check("F 리그우승 → 예외-리그우승", X(mk([5.0, 4.9]), {"big5_champ": True}) == ["예외-리그우승"])
+check("F 격차 1.00 정확히 → 예외-개인압도", X(mk([6.0, 5.0, 4.0]), {}) == ["예외-개인압도"])
+check("F 격차 0.99 → 없음", X(mk([6.0, 5.01]), {}) == [])
+check("F 격차는 Top10 안 개인 최고와(2위가 아니라)", X(mk([6.0, 4.0, 5.5]), {}) == [])
+check("F Top10 밖(11번째)은 격차 비교에서 제외", X(mk([6.0] + [4.0] * 9 + [5.9]), {}) == ["예외-개인압도"])
+check("F 둘 다 → 둘 다", X(mk([7.0, 5.0]), {"big5_champ": True}) == ["예외-리그우승", "예외-개인압도"])
+check("F personal 없으면 개인압도 판정 안 함", X([{"player_id": 0}, {"player_id": 1}], {}) == [])
+check("F 빈 목록 → 없음", X([], {"big5_champ": True}) == [])
+okset = {2}
+po = lambda e: ["X"] if e["player_id"] in okset else []
+t = mk([6.0, 5.8, 5.5, 5.0])
+n0, p0 = B.apply_top1_gate(t, po)
+n1, p1 = B.apply_top1_gate(t, po, exception_of=lambda lst: [])
+check("F 예외 없음 → 기존과 같음", [e["player_id"] for e in n1] == [e["player_id"] for e in n0] == [2, 0, 1, 3] and p1 == p0 == ["X"])
+n2, p2 = B.apply_top1_gate(t, po, exception_of=lambda lst: ["예외-리그우승"])
+check("F 1위 예외 → 1위 유지·순서 그대로", [e["player_id"] for e in n2] == [0, 1, 2, 3] and p2 == ["예외-리그우승"])
+okset = {0}
+n3, p3 = B.apply_top1_gate(t, po, exception_of=lambda lst: ["예외-리그우승"])
+check("F 1위가 기존 자격자면 기존 경로 그대로(예외 안 봄)", [e["player_id"] for e in n3] == [0, 1, 2, 3] and p3 == ["X"])
+okset = set()
+n4, p4 = B.apply_top1_gate(t, po, exception_of=lambda lst: ["예외-개인압도"])
+check("F 자격자 없음 + 예외 → 순서 그대로·예외 경로", [e["player_id"] for e in n4] == [0, 1, 2, 3] and p4 == ["예외-개인압도"])
+n5, p5 = B.apply_top1_gate(t, po)
+check("F 자격자 없음 + 예외 없음 → 예전대로(빈 경로)", [e["player_id"] for e in n5] == [0, 1, 2, 3] and p5 == [])
+check("F 입력 리스트 불변", [e["player_id"] for e in t] == [0, 1, 2, 3])
+
 print()
 if fails:
     print(f"실패 {len(fails)}건: {fails}")

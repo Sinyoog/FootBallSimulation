@@ -38,6 +38,25 @@ VET_AGE = 35                   # 대체자·보충 영입에서 뺀다(노장 �
 CELL_TO_POS = {"GK": "GK", "CB": "CB", "LB": "LB", "RB": "RB", "CDM": "CDM", "CM": "CM",
                "CAM": "CAM", "LW": "LW", "RW": "RW", "FW": "ST"}
 LOG = collections.Counter()    # 계측(동작과 무관). 측정 러너가 읽고 비운다.
+
+
+def r1():
+    """[2026-11-25 장부 R1] constants.SUB_POS_LEDGER_R1 — 꺼져 있으면 아래 R1 경로는 모두 무동작(예전과 같다)."""
+    return bool(getattr(_C, "SUB_POS_LEDGER_R1", False))
+
+
+def newbie_lvl_ok(dep):
+    """판매 신인을 허용하는 부족 단계 — 기본은 깊이 부족(L3)만. [2026-11-25 장부 R1 보완 (나)] R1과
+    SUB_POS_LEDGER_R1_L2_NEWBIE가 켜져 있으면 주포 부족 게이트의 L2도 허용."""
+    if dep["lvl"] == 3:
+        return True
+    return (dep["lvl"] == 2 and bool(dep.get("main")) and r1()
+            and bool(getattr(_C, "SUB_POS_LEDGER_R1_L2_NEWBIE", False)))
+
+
+def main_cell(pos):
+    """등록 포지션의 장부 칸(부포 무시)."""
+    return _ST.REGISTERED_TO_TARGET.get(pos)
 STATS_SRC = collections.Counter()   # [2026-11-22 1단계] 공급원 후보 탐색 결과(계측)
 HANDOFF = {}                   # 여름 이적시장 장부 → 끌어올리기(같은 오프시즌, 바로 다음 경로)
 
@@ -140,8 +159,30 @@ def levels(f, T):
 
 def cells_of(pos, sub):
     p = _ST.REGISTERED_TO_TARGET.get(pos)
+    if sub.__class__ is tuple:
+        # [2026-11-25 SUB_POS_V2] 부포 2개 — 주포와 다른 칸만(같은 칸 부포는 인원으로 안 센다). 0칸 None, 1칸 문자열
+        # (부포 1개와 같은 값·같은 경로), 2칸 튜플.
+        out = []
+        for x in sub:
+            s = _ST.SLOT_TO_TARGET.get(x) if x else None
+            if p and s and s != p and s not in out:
+                out.append(s)
+        return p, (None if not out else (out[0] if len(out) == 1 else tuple(out)))
     s = _ST.SLOT_TO_TARGET.get(sub) if sub else None
     return p, (s if (p and s and s != p) else None)
+
+
+def cell_list(pos, sub):
+    """[2026-11-25 SUB_POS_V2] 그 선수가 설 수 있는 칸들(주포 칸, 부포 칸...) — 부포가 문자열이면 예전 cells_of와 같은 2개."""
+    a, b = cells_of(pos, sub)
+    return ((a,) + b) if b.__class__ is tuple else (a, b)
+
+
+def _moves(prim_i, alt_i, cur):
+    """[2026-11-25 SUB_POS_V2] 지금 칸 cur에서 옮겨 갈 수 있는 칸들 — 부포 1개면 예전 _other와 같은 한 칸."""
+    if alt_i.__class__ is tuple:
+        return [x for x in (prim_i,) + alt_i if x and x != cur]
+    return (alt_i if cur == prim_i else prim_i,)
 
 
 def assign(entries, lv):
@@ -164,8 +205,6 @@ def assign_ab(prim, alt, lv):
             if t:
                 at[t].append(i)
 
-        def _other(i):
-            return alt[i] if asg[i] == prim[i] else prim[i]
         for tg in lv:
             while True:
                 sources = [t for t in CELLS if cnt[t] > tg.get(t, 0)]
@@ -180,15 +219,17 @@ def assign_ab(prim, alt, lv):
                     u = queue[qi]
                     qi += 1
                     for i in at[u]:
-                        v = _other(i)
-                        if not v or v in seen:
-                            continue
-                        seen.add(v)
-                        parent[v] = (u, i)
-                        if cnt[v] < tg.get(v, 0):
-                            goal = v
+                        for v in _moves(prim[i], alt[i], asg[i]):
+                            if not v or v in seen:
+                                continue
+                            seen.add(v)
+                            parent[v] = (u, i)
+                            if cnt[v] < tg.get(v, 0):
+                                goal = v
+                                break
+                            queue.append(v)
+                        if goal is not None:
                             break
-                        queue.append(v)
                 if goal is None:
                     break
                 v = goal
@@ -297,6 +338,21 @@ class TeamBook:
     def d(self):
         return self.calc()[3]
 
+    def dm(self):
+        """[2026-11-25 장부 R1] 주포만 센 (d1, d2, d3) — 전문 선수 부족 진단(부포는 세지 않는다)."""
+        return self._d_from(self._cnt)
+
+    def m_deficits(self):
+        """[2026-11-25 장부 R1] 주포만 센 칸 부족 [(단계, 부족량, 칸)] — deficits()와 같은 정렬. GK 제외."""
+        out = []
+        for c in FIELD:
+            for k, tg in enumerate(self.lv(), 1):
+                if self._cnt[c] < tg.get(c, 0):
+                    out.append((k, tg[c] - self._cnt[c], c))
+                    break
+        out.sort(key=lambda x: (x[0], -x[1], CELLS.index(x[2])))
+        return out
+
     def fresh_d(self):
         """증분 계산을 쓰지 않고 명단 전체로 다시 배정한 (d1, d2, d3) — 보충 패스 단계별 재확인용."""
         ids = sorted(self.players)
@@ -343,9 +399,9 @@ class TeamBook:
             u = amap[i]
             if u is None:
                 continue
-            v = b if u == a else a
-            if v:
-                edges[u].add(v)
+            for v in _moves(a, b, u):
+                if v:
+                    edges[u].add(v)
         queue = list(reach)
         while queue:
             u = queue.pop()
@@ -354,6 +410,11 @@ class TeamBook:
                     reach.add(v)
                     queue.append(v)
         out = {i for i in ids if amap[i] in reach}
+        if r1():
+            # [2026-11-25 장부 R1] 자기 주포 칸에 L3 목표보다 주포가 많은 선수만 — 부포 선수가 메워 준다는 이유로 전문 선수를
+            # 자유 판매로 보지 않는다(부포 선수 본인도 자기 주포 칸에 여유가 있어야 자유).
+            mc = self._cnt
+            out = {i for i in out if pl[i][3] and mc[pl[i][3]] > tg3.get(pl[i][3], 0)}
         self._free, self._fv = out, self.ver
         return out
 
@@ -362,7 +423,13 @@ class TeamBook:
         if s <= 0:
             return None
         ids, cnt, amap, d = self.calc()
-        ov = sorted((self.players[i][2] for i in ids if amap[i] == cell), reverse=True)
+        if r1():
+            # [2026-11-25 장부 R1] 선발 자리는 주포 우선 — 주포 OVR 높은 순, 모자라면 부포 선수(OVR 높은 순)
+            ov = [o for _m, o in sorted(((self.players[i][3] != cell, -self.players[i][2]) for i in ids
+                                         if amap[i] == cell))]
+            ov = [-o for o in ov]
+        else:
+            ov = sorted((self.players[i][2] for i in ids if amap[i] == cell), reverse=True)
         if not ov:
             return None
         return ov[min(s, len(ov)) - 1]
@@ -374,7 +441,11 @@ class TeamBook:
             s = starters(self.f).get(c, 0)
             if s <= 0:
                 continue
-            ov = sorted((self.players[i][2] for i in ids if amap[i] == c), reverse=True)[:s]
+            if r1():   # [2026-11-25 장부 R1] 선발 자리는 주포 우선
+                ov = [-o for _m, o in sorted(((self.players[i][3] != c, -self.players[i][2]) for i in ids
+                                              if amap[i] == c))][:s]
+            else:
+                ov = sorted((self.players[i][2] for i in ids if amap[i] == c), reverse=True)[:s]
             for o in ov:
                 out = o if out is None else min(out, o)
         return out or 0
@@ -387,12 +458,16 @@ class TeamBook:
         by = collections.defaultdict(list)
         for i in ids:
             if amap[i]:
-                by[amap[i]].append((-self.players[i][2], i))
+                if r1():   # [2026-11-25 장부 R1] 같은 칸 안에서 주포가 먼저 선발·로테이션 자리를 맡는다
+                    by[amap[i]].append((self.players[i][3] != amap[i], -self.players[i][2], i))
+                else:
+                    by[amap[i]].append((-self.players[i][2], i))
         out = {i: "W" for i in ids}
         for c, lst in by.items():
             lst.sort()
             s, r = lv[0].get(c, 0), lv[1].get(c, 0)
-            for k, (_o, i) in enumerate(lst):
+            for k, e in enumerate(lst):
+                i = e[-1]
                 out[i] = "S" if k < s else ("R" if k < r else "W")
         return out
 
@@ -427,7 +502,7 @@ class Ledger:
         import sub_positions as _SP
         f, T = self._tinfo[tid]
         b = self.books[tid] = TeamBook(tid, f, T)
-        subs = _SP._load() if _SP.active() else {}
+        subs = _SP._load_entries() if _SP.active() else {}   # [2026-11-25 SUB_POS_V2] 2개면 튜플
         for pid, pos, ovr, nat, lty, loan, age in self._c.execute(
                 "SELECT id, position, ovr, nationality, last_transfer_year, on_loan_from_team_id, age "
                 "FROM ai_players WHERE team_id=? ORDER BY id", (tid,)).fetchall():
@@ -500,7 +575,7 @@ class Ledger:
                                   floor=(rng[0] if rng else 30),
                                   qhi=get_foreign_quota_range(cn, cont, tier=tier)[1], me=(tid == me))
             self.books[tid] = TeamBook(tid, f, target_size(g, tier, youth))
-        subs = _SP._load() if _SP.active() else {}
+        subs = _SP._load_entries() if _SP.active() else {}   # [2026-11-25 SUB_POS_V2] 2개면 튜플
         self.pinfo = {}
         _bget = self.books.get
         _sget = subs.get
@@ -515,6 +590,11 @@ class Ledger:
                 continue
             sb = _sget(pid)
             o = ovr or 0
+            if sb.__class__ is tuple:   # [2026-11-25 SUB_POS_V2] 부포 2개
+                a, bb = cells_of(pos, sb)
+                b._put(pid, (pos, sb, o, a, bb))
+                pinfo[pid] = [tid, pos, sb, o, nat or "", lty or 0, loan, age or 25]
+                continue
             a = _r2t(pos)
             sc = _s2t(sb) if sb else None
             b._put(pid, (pos, sb, o, a, (sc if (a and sc and sc != a) else None)))
@@ -591,6 +671,8 @@ class Ledger:
         cnt1, _a1, d1 = b.d_change(drop=(X,), add=add)
         inc = [k for k in range(3) if d1[k] > d0[k]]
         if not inc:
+            if r1():
+                return self._main_departure(b, X, Y, d0)
             return None
         lvl = inc[0] + 1
         tg = b.lv()[inc[0]]
@@ -598,7 +680,46 @@ class Ledger:
         sc = b.starter_min(cell) if cell else None
         ovx = b.players[X][2]
         ref = min(ovx, sc) if sc is not None else ovx
+        if r1():
+            # [2026-11-25 장부 R1 보완 — 판매 게이트 우선순위] 장부 부족과 주포 부족이 같이 늘면 주포 부족 게이트가 먼저다
+            # (대체 후보는 그 칸 주포만). 주포 수는 X의 주포 칸에서만 줄어드므로 주포 부족 칸 = X의 주포 칸.
+            # X가 판매 전 주포 칸이 아닌 칸에 배정돼 있었으면(need_cov) 대체 선수가 X 자리를 그대로 이어받지 못하므로
+            # 대체 후보마다 장부 부족이 판매 전으로 돌아가는지 따로 확인한다(cov_d0).
+            md = self._main_departure(b, X, Y, d0)
+            if md is not None:
+                md["cov_cell"] = cell
+                md["cov_lvl"] = lvl
+                md["lvl"] = min(md["lvl"], lvl)   # 신인(깊이 부족 전용) 허용 여부는 두 부족 중 더 앞 단계 기준
+                md["need_cov"] = amap.get(X) != md["cell"]
+                LOG["dep_both|" + ("same" if cell == md["cell"] else "diff")] += 1
+                if md["need_cov"]:
+                    LOG["dep_both|need_cov"] += 1
+                return md
+            return {"lvl": lvl, "cell": cell, "ref": ref, "d0": d0, "gk": cell == "GK", "main": False}
         return {"lvl": lvl, "cell": cell, "ref": ref, "d0": d0, "gk": cell == "GK"}
+
+    def _main_departure(self, b, X, Y, d0):
+        """[2026-11-25 장부 R1] 장부 부족은 안 늘지만 주포만 센 부족(L1~L3)이 늘면 판정 정보("main": True), 아니면 None.
+        칸은 X의 주포 칸(주포 수가 줄어드는 유일한 칸)."""
+        a = b.players[X][3]
+        if not a:
+            return None
+        cnt = collections.Counter(b._cnt)
+        cnt[a] -= 1
+        if Y is not None:
+            ya = main_cell(Y[0])
+            if ya:
+                cnt[ya] += 1
+        dm0 = b._d_from(b._cnt)
+        dm1 = b._d_from(cnt)
+        inc = [k for k in range(3) if dm1[k] > dm0[k]]
+        if not inc:
+            return None
+        sc = b.starter_min(a)
+        ovx = b.players[X][2]
+        ref = min(ovx, sc) if sc is not None else ovx
+        LOG[f"dep_main|L{inc[0] + 1}|{a}"] += 1
+        return {"lvl": inc[0] + 1, "cell": a, "ref": ref, "d0": d0, "gk": a == "GK", "main": True, "dm0": dm0}
 
     # ── 자유 판매 색인 ──
     def _src_ok(self, tid):
@@ -618,7 +739,7 @@ class Ledger:
 
     def _idx_put(self, pid, add):
         info = self.pinfo[pid]
-        for c in cells_of(info[1], info[2]):
+        for c in cell_list(info[1], info[2]):
             if c and c != "GK":
                 fc = self._free_cell.setdefault((info[0], c), set())
                 if add:
@@ -644,7 +765,7 @@ class Ledger:
             self._free[tid] = fr
             for pid in fr:
                 info = self.pinfo[pid]
-                for c in cells_of(info[1], info[2]):
+                for c in cell_list(info[1], info[2]):
                     if c and c != "GK":
                         self._idx[c].append((info[3], pid))
                         self._idx_nat[(c, info[4])].append((info[3], pid))
@@ -699,7 +820,18 @@ class Ledger:
         return ms["qhi"] is not None and fc + 1 <= ms["qhi"]
 
     # ── [2026-11-22 1단계] 공급원(실제 산하팀 → 없으면 가상 유스) 승격 후보 ──
-    def source_candidate(self, S, X, cell, lo=None, stats=True):
+    def source_candidate(self, S, X, cell, lo=None, stats=True, main_only=False, cov_d0=None):
+        """[2026-11-25 장부 R1] R1이면 그 칸이 주포인 선수부터 찾고, main_only가 아니면 없을 때 부포 선수까지 본다.
+        cov_d0: 주어지면 X 대신 후보가 들어와 장부 부족이 cov_d0보다 나빠지지 않는 후보만(주포 게이트 need_cov)."""
+        if r1():
+            r = self._source_candidate(S, X, cell, lo, stats, True, cov_d0)
+            if r is not None or main_only:
+                LOG["r1_src_main" if r is not None else "r1_src_main_none"] += 1
+                return r
+            LOG["r1_src_fallback"] += 1
+        return self._source_candidate(S, X, cell, lo, stats, False)
+
+    def _source_candidate(self, S, X, cell, lo=None, stats=True, mf=False, cov_d0=None):
         """S에 cell 칸으로 올릴 공급원 선수 — (선수, 출처 팀, 종류 'affiliate'|'virtual') 또는 None.
         조건: 연간 한도(PROMO_LIMIT) 안, 그 칸에 설 수 있음, GK 아님, 임대·이번 창구 이동 아님, 나이 ≤ MAX_AGE,
         OVR ≥ lo(판매 거래 안에서만, 보충은 lo=None), 실제 산하팀은 그 팀 선발·규칙 부족(d1·d2)이 늘지 않음,
@@ -730,7 +862,9 @@ class Ledger:
                 info = self.pinfo.get(p)
                 if info is None or info[1] == "GK" or info[6] or self.moved(p):
                     continue
-                if (info[7] or 0) > _VY.MAX_AGE or cell not in cells_of(info[1], info[2]):
+                if (info[7] or 0) > _VY.MAX_AGE or cell not in cell_list(info[1], info[2]):
+                    continue
+                if mf and main_cell(info[1]) != cell:
                     continue
                 if lo is not None and info[3] < lo:
                     continue
@@ -746,11 +880,77 @@ class Ledger:
                         continue
                 if self.is_foreign(p, S) and not self.quota_room(S, X):
                     continue
+                if cov_d0 is not None and not self._cov_ok(S, X, p, cov_d0):
+                    continue
                 best = (k, p, src, kind)
         if best is None:
             _st["no_candidate"] += 1
             return None
         return best[1], best[2], best[3]
+
+    def source_diag(self, S, X, cell, lo=None, mf=False, cov_d0=None):
+        """[2026-11-25 계측 전용 — 동작 무관, 읽기만] _source_candidate가 후보를 못 찾은 이유를 같은 조건 순서로 판정.
+        연간 한도·공급원 없음은 그 자체가 이유. 그 밖엔 후보를 단계별로 걸러 처음으로 0명이 되는 단계:
+        pool_empty(풀에 GK 아닌 선수 없음) → loan_or_moved(임대·이번 창구 이동) → age(23세 초과) → position(그 칸에 설 수
+        있는 선수 없음) → main_only(부포 선수만 있음 — 주포 게이트) → ovr_lo(승격 OVR 하한 미달) → affiliate_guard(실제
+        산하팀 부족 보호) → quota(외국인 정원) → coverage(장부 부족 복원 실패). 한도에 걸린 경우 한도를 빼고도 후보가
+        있었는지 함께 돌려준다(limit|cand / limit|nocand)."""
+        if not self._stage1 or S not in self.meta:
+            return "off"
+        chs = sorted(self.children.get(S, ()))
+        if chs:
+            pools = [(ch, "affiliate", sorted(self.books[ch].players) if ch in self.books else []) for ch in chs]
+        else:
+            vt = next((t for t, p in self.vparent.items() if p == S), None)
+            pools = [(vt, "virtual", sorted(self.vpool.get(S, ())))] if vt is not None else []
+        if not pools:
+            return "no_source"
+        _g3 = bool(getattr(_C, "YOUTH_PROMO_D3_GUARD", False))
+        n = collections.Counter()
+        for src, kind, pids in pools:
+            cb = self.books.get(src) if kind == "affiliate" else None
+            d_ch = cb.d() if cb is not None else None
+            for p in pids:
+                if p <= 0 or p == X:
+                    continue
+                info = self.pinfo.get(p)
+                if info is None or info[1] == "GK":
+                    continue
+                n["pool_empty"] += 1
+                if info[6] or self.moved(p):
+                    continue
+                n["loan_or_moved"] += 1
+                if (info[7] or 0) > _VY.MAX_AGE:
+                    continue
+                n["age"] += 1
+                if cell not in cell_list(info[1], info[2]):
+                    continue
+                n["position"] += 1
+                if mf and main_cell(info[1]) != cell:
+                    continue
+                n["main_only"] += 1
+                if lo is not None and info[3] < lo:
+                    continue
+                n["ovr_lo"] += 1
+                if cb is not None:
+                    dn = cb.d_change(drop=(p,))[2]
+                    if dn[0] > d_ch[0] or dn[1] > d_ch[1] or (_g3 and dn[2] > d_ch[2]):
+                        continue
+                n["affiliate_guard"] += 1
+                if self.is_foreign(p, S) and not self.quota_room(S, X):
+                    continue
+                n["quota"] += 1
+                if cov_d0 is not None:
+                    inf = self.pinfo[p]
+                    if worse(self.books[S].d_change(drop=(X,), add=((inf[1], inf[2]),))[2], cov_d0):
+                        continue
+                n["coverage"] += 1
+        stages = ("pool_empty", "loan_or_moved", "age", "position", "main_only", "ovr_lo", "affiliate_guard", "quota",
+                  "coverage")
+        why = next((s for s in stages if n[s] == 0), "ok")
+        if self.promo[S] >= _VY.PROMO_LIMIT:
+            return "limit|" + ("cand" if why == "ok" else "nocand")
+        return why
 
     def promote(self, p, src, S, kind):
         """장부 반영: 공급원 선수 p를 S로(DB 기록은 호출부). 연간 승격 수 +1."""
@@ -760,17 +960,33 @@ class Ledger:
         self.promo[S] += 1
         LOG[f"promo|{kind}"] += 1
 
-    def find_R(self, S, X, cell, ref, d0, lo=None, excl=None, tag="R_"):
+    def _cov_ok(self, S, X, R, d0):
+        """[2026-11-25 장부 R1 보완] S에서 X가 나가고 R이 들어오면 장부 부족이 d0보다 나빠지지 않나."""
+        LOG["r1_cov_chk"] += 1
+        inf = self.pinfo[R]
+        ok = not worse(self.books[S].d_change(drop=(X,), add=((inf[1], inf[2]),))[2], d0)
+        if not ok:
+            LOG["r1_cov_chk_fail"] += 1
+        return ok
+
+    def find_R(self, S, X, cell, ref, d0, lo=None, excl=None, tag="R_", main_only=False, cov_d0=None):
         """S에 cell 칸 대체자(자유 판매 선수) — 같은 리그 → 국내 → 세계, 기준 OVR에 가까운 순. 없으면 None.
-        excl: 후보에서 뺄 소속 팀(연쇄 이적 B팀 대체자 — A·목적지 팀 선수 제외). tag: 계측 이름 앞머리."""
+        excl: 후보에서 뺄 소속 팀(연쇄 이적 B팀 대체자 — A·목적지 팀 선수 제외). tag: 계측 이름 앞머리.
+        [2026-11-25 장부 R1] R1이면 그 칸이 주포인 선수부터 찾고, main_only가 아니면 없을 때 부포 선수까지 본다."""
         import time as _t
         _t0 = _t.perf_counter()
         try:
+            if r1():
+                r = self._find_R(S, X, cell, ref, d0, lo, excl, tag, True, cov_d0)
+                if r is not None or main_only:
+                    LOG["r1_findR_main" if r is not None else "r1_findR_main_none"] += 1
+                    return r
+                LOG["r1_findR_fallback"] += 1
             return self._find_R(S, X, cell, ref, d0, lo, excl, tag)
         finally:
             LOG["t_findR_us"] += int((_t.perf_counter() - _t0) * 1000000)
 
-    def _find_R(self, S, X, cell, ref, d0, lo=None, excl=None, tag="R_"):
+    def _find_R(self, S, X, cell, ref, d0, lo=None, excl=None, tag="R_", mf=False, cov_d0=None):
         if self._idx is None:
             self._build_idx()
         ms = self.meta[S]
@@ -787,7 +1003,11 @@ class Ledger:
                 if excl and t in excl:
                     continue
                 for R in sorted(self._free_cell.get((t, cell), ())):
+                    if mf and main_cell(self.pinfo[R][1]) != cell:
+                        continue
                     if self._ok_R(R, S, X, cell, lo, d0, yam):
+                        if cov_d0 is not None and not self._cov_ok(S, X, R, cov_d0):
+                            continue
                         k = (abs(self.pinfo[R][3] - ref), R)
                         if best is None or k < best:
                             best = k
@@ -820,7 +1040,9 @@ class Ledger:
                 j -= 1
             if excl and self.pinfo[cand[1]][0] in excl:
                 continue
-            if self._ok_R(cand[1], S, X, cell, lo, d0, yam):
+            if mf and main_cell(self.pinfo[cand[1]][1]) != cell:
+                continue
+            if self._ok_R(cand[1], S, X, cell, lo, d0, yam) and (cov_d0 is None or self._cov_ok(S, X, cand[1], cov_d0)):
                 LOG[tag + "세계"] += 1
                 return cand[1]
         return None
@@ -835,7 +1057,7 @@ class Ledger:
             for pid, info in self.pinfo.items():
                 if pid <= 0 or info[0] not in self.books:
                     continue
-                for c in cells_of(info[1], info[2]):
+                for c in cell_list(info[1], info[2]):
                     if c and c != "GK":
                         ix[(c, info[4])].append((info[3], pid))
             for v in ix.values():
@@ -889,6 +1111,8 @@ class Ledger:
                 continue
             if p in self.books[B].free_ids():
                 continue
+            if dep.get("main") and main_cell(info[1]) != cell:
+                continue
             if self.chain_supply[B] >= cap:
                 n_cap += 1
                 continue
@@ -914,7 +1138,8 @@ class Ledger:
                 why["B_dep_none"] += 1
                 continue
             bkB = self.books[B]
-            R2 = self.find_R(B, P, depB["cell"], depB["ref"], depB["d0"], excl=(A, dst), tag="chainR_")
+            R2 = self.find_R(B, P, depB["cell"], depB["ref"], depB["d0"], excl=(A, dst), tag="chainR_",
+                             main_only=bool(depB.get("main")), cov_d0=depB["d0"] if depB.get("need_cov") else None)
             if R2 is not None:
                 ri = self.pinfo[R2]
                 if not worse(bkB.d_change(drop=(P,), add=((ri[1], ri[2]),))[2], depB["d0"]):
@@ -924,7 +1149,9 @@ class Ledger:
             else:
                 why["b_none"] += 1
             if self._stage1:
-                sc = self.source_candidate(B, P, depB["cell"], depB["ref"] - M_REPL, stats=False)
+                sc = self.source_candidate(B, P, depB["cell"], depB["ref"] - M_REPL, stats=False,
+                                           main_only=bool(depB.get("main")),
+                                           cov_d0=depB["d0"] if depB.get("need_cov") else None)
                 if sc is not None and (sc[1] in (A, dst) or sc[0] == X):
                     why["c_src_conflict"] += 1   # B의 공급원이 A·목적지 팀(그 팀 선수를 빼면 그 팀 판정이 달라진다)
                 elif sc is not None:
@@ -1002,11 +1229,27 @@ class Ledger:
         self._refresh(tid)
 
     # ── 보충 칸 고르기(신인 생성) ──
-    def pick_cell(self, tid, rng, exc_prob):
-        return pick_cell_book(self.books.get(tid), rng, exc_prob)
+    def pick_cell(self, tid, rng, exc_prob, retiree_pos=None):
+        return pick_cell_book(self.books.get(tid), rng, exc_prob, retiree_pos)
 
 
-def pick_cell_book(b, rng, exc_prob):
+def _pick_main_first(b, xm):
+    """[2026-11-25 은퇴 대체 D안 — RETIRE_REPL_MAINFIRST] ① 장부 L1 → ② 주포 L1 → ③ 주포 L2 → ④ 은퇴자 주포 칸에 주포
+    L3 부족이 있으면 그 칸. 해당 없으면 None(기존 결정 분기로). 난수 없음. (칸, 단계) 반환."""
+    dd = b.deficits()
+    if dd and dd[0][0] == 1:
+        return dd[0][2], "cov_L1"
+    md = b.m_deficits()
+    for lv in (1, 2):
+        x = [e for e in md if e[0] == lv]
+        if x:
+            return x[0][2], f"main_L{lv}"
+    if xm in FIELD and any(e[2] == xm for e in md):
+        return xm, "retiree_L3"
+    return None, None
+
+
+def pick_cell_book(b, rng, exc_prob, retiree_pos=None):
         """신인 1명의 칸 — 가장 심한 단계·부족량 큰 칸(GK 제외). exc_prob 확률로 목표표 비율 추첨(세대 변동 여지,
         기존 예외 15%와 같은 역할). 부족이 없으면 목표표(n+1)에서 아직 못 채운 첫 칸. 난수: rng.random() 1번
         (+ 예외일 때 1번)."""
@@ -1025,6 +1268,12 @@ def pick_cell_book(b, rng, exc_prob):
                     return c
             return items[-1][0]
         if b is not None:
+            if retiree_pos is not None and getattr(_C, "RETIRE_REPL_MAINFIRST", False):
+                c, how = _pick_main_first(b, main_cell(retiree_pos))
+                if c is not None:
+                    LOG[f"retire_D|{how}"] += 1
+                    return c
+                LOG["retire_D|fallback"] += 1
             dd = b.deficits()
             if dd:
                 LOG["pick_deficit"] += 1

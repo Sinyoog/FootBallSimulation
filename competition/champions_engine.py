@@ -63,7 +63,7 @@ def _get_field_pos(p):
         slots = FORMATION_SLOTS.get(formation, FORMATION_SLOTS["4-4-2"])
         # [2026-10 주포·부포] 내 부포 슬롯은 순위 SUB_POS_RANK(부포 = OVR −1, 클럽 대항전 = 클럽 범위)
         import sub_positions as _subp
-        _my_sub = _subp.my_sub()
+        _my_sub = _subp.my_entry()      # [2026-11-25 SUB_POS_V2] 2개면 튜플
         if _my_sub:
             return _subp.best_slot(primary, _my_sub, slots)
         compat = POSITION_COMPAT.get(primary, [primary])

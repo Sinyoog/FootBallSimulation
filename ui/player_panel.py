@@ -598,18 +598,22 @@ class PlayerPanel(QWidget):
             ("국적",   _nat_str),
             ("소속",   team_name),
             ("리그",   league_name),
-            ("주포",       p["position"]),
+            # [2026-11-25 신민용 요청: "현 포지션 주포 부포 부포 이렇게 위치하게"] 순서 변경 — 부포 줄은 아래에서 넣는다.
             ("현 포지션",   _cur_field_pos),
+            ("주포",       p["position"]),
         ]
         # [2026-10 주포·부포] 내 부포를 주포 바로 아래 줄에 넣는다.
         # [2026-11-17 변경, 신민용 요청: "플레이어 패널에도 주포 부포"] 포메이션 선수 창과 같은 이름(주포·부포)으로
         # 맞추고, 부포가 없어도 줄은 보이게 한다("—") — 예전엔 부포가 있을 때만 줄이 생겨서 평소엔 안 보였다.
+        # [2026-11-25 신민용 요청: "부포 하나 더 늘려야지"] 부포 1·부포 2 두 줄(없으면 "—"), 같은 칸 부포는 "(전술 활용)".
+        # [2026-11-26 신민용 요청: "플레이어 패널도 부포 창 절반으로 나눠서 부포2까지"] 다시 한 줄 "부포" — 값 칸을
+        # 반으로 나눠 왼쪽 = 부포 1, 오른쪽 = 부포 2(없으면 "—", 같은 칸 부포는 "LM*", 칸에 마우스를 올리면 설명).
         try:
             import sub_positions as _subp
-            _my_sub = _subp.my_sub()
+            _my_subs = _subp.display_subs(_subp.MY_ID, p.get("position") or "")
         except Exception:
-            _my_sub = None
-        rows.insert(5, ("부포", _my_sub or "—"))
+            _my_subs = []
+        rows.insert(6, ("부포", _SubSplitRow(_my_subs)))
         # [2026-08 신설, 난이도 시스템] 성격/신체특징(부상·성장 관련 숨겨진
         # 특성)/감독관계는 어려움 난이도에서 비표시 — 키/몸무게/체형처럼
         # 겉으로 관찰 가능한 정보가 아니라 원래 내부 수치이기 때문에
@@ -634,7 +638,10 @@ class PlayerPanel(QWidget):
                      f"연 {fmt_money(salary)}  [주 {fmt_money(weekly)}]"))
         rows.append(("총자산", fmt_money(p.get("total_assets",0))))
         for k, v in rows:
-            self.info_lay.addWidget(_info_row(k, v))
+            if isinstance(v, _SubSplitRow):
+                self.info_lay.addWidget(_info_row_split(k, v.subs))
+            else:
+                self.info_lay.addWidget(_info_row(k, v))
         # [2026-08 수정, 신민용 리포트: "감독관계 성향 설명 문구가 쓸데없다 +
         # 팀이 없는데도 감독관계가 표시된다"] 감독 성향은 이름만 표시(desc
         # 문구 제거)하고, 소속팀이 없으면(current_team_id 없음) 애초에 감독이
@@ -969,6 +976,47 @@ def _info_row(key, val):
 
     h.addWidget(kl)
     h.addWidget(vl, 1)   # 값칸이 남는 폭을 모두 차지
+    return w
+
+
+class _SubSplitRow:
+    """[2026-11-26] rows 목록 안에서 "부포 반반 줄"을 표시하는 표식(값 = display_subs 결과)."""
+    __slots__ = ("subs",)
+
+    def __init__(self, subs):
+        self.subs = list(subs or [])
+
+
+def _info_row_split(key, subs):
+    """[2026-11-26 신설, 신민용 요청: "부포 창 절반으로 나눠서 부포2까지"] _info_row와 같은 라벨칸 + 값칸을
+    1:1로 나눈 두 칸 — 왼쪽부터 부포 1, 부포 2. 없으면 "—", 같은 칸 부포는 "LM*". 칸마다 툴팁으로 설명."""
+    try:
+        from ui import sub_split as _ssplit
+        halves = _ssplit.halves(subs)
+    except Exception:
+        halves = [((subs[i][0] if i < len(subs) and subs[i][0] else "—"), "", bool(i < len(subs) and subs[i][0]))
+                  for i in range(2)]
+    w = QFrame()
+    w.setObjectName("infoRow")
+    h = QHBoxLayout(w)
+    h.setContentsMargins(0, 0, 0, 0)
+    h.setSpacing(0)
+
+    kl = QLabel(key)
+    kl.setObjectName("infoKey")
+    kl.setFixedWidth(64)
+    kl.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter)
+    kl.setToolTip("왼쪽 = 부포 1, 오른쪽 = 부포 2 (* = 같은 칸 부포, 전술 활용)")
+    h.addWidget(kl)
+    for i, (txt, tip, has) in enumerate(halves):
+        vl = QLabel(txt if has else "—")
+        vl.setObjectName("infoValMid" if i == 0 else "infoVal")
+        vl.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        if not has:
+            vl.setStyleSheet("color: #777777;")
+        if tip:
+            vl.setToolTip(tip)
+        h.addWidget(vl, 1)
     return w
 
 
